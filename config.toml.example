@@ -1,0 +1,3 @@
+[mcp_servers.dgs-npp]
+command = "python"
+args = ['C:\path\to\dgs-npp-mcp\server.py']

@@ -1,0 +1,2 @@
+DGS Notepad++ headless probe document.
+The window probe checks that this text reaches a Scintilla buffer.

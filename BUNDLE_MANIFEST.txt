@@ -1,0 +1,18 @@
+DGS Notepad++ MCP self-contained bundle
+MCP version: 0.8.2
+Bundled runtime: runtime\notepad-plus-plus-headless\notepad++.exe
+Notepad++ version: 8.5.7 x64
+Executable SHA256: 4675EADE20530B7BFD1EDF9DF12CA165AB419DFA165B14A46539C6114E373573
+Corresponding source: https://github.com/lmaoha/notepad-plus-plus/tree/dgs-headless-8.5.7-1
+Modified source commit: 5e786a67bcb62ba4aee1a25ab5b554fbf630d8c7
+Official base commit: 5008b8a0cccfff255c5f48b5782ef993b6f9b631
+OriginalFilename: notepad++.exe
+InternalName: notepad++.exe
+Default launch: -multiInst -nosession -headless
+Default EXE selection: relative to npp_bridge.py; no NPP_EXE required
+User N++ replacement: none
+Runtime probe: tools\verify-bundled-runtime.ps1 -Json
+Broker lifecycle probe: tools\verify-broker-headless-lifecycle.py <DGS-path> <query>
+MCP tests: python -m unittest discover -s tests -v
+Focused workflow: dgs_search -> dgs_apply_patch (no full document in MCP arguments)
+Search engine: Python in-process literal/regex search; no rg.exe dependency
