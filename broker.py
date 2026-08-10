@@ -31,7 +31,7 @@ except Exception:
 
 
 SERVER_NAME = "dgs_npp_broker"
-SERVER_VERSION = "0.8.2"
+SERVER_VERSION = "0.8.3"
 BROKER_DIR = Path(__file__).resolve().parent
 STATE_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "dgs-npp-mcp"
 STATE_FILE = STATE_DIR / "npp-instance-broker.json"
@@ -48,7 +48,7 @@ SW_SHOW = 5
 SW_RESTORE = 9
 WM_CLOSE = 0x0010
 MAX_SAFE_JSON_INTEGER = (1 << 53) - 1
-OWNERSHIP_STATE_VERSION = 2
+OWNERSHIP_STATE_VERSION = 3
 
 
 def _load_bridge() -> Any:
@@ -63,11 +63,21 @@ def _load_bridge() -> Any:
 
 
 bridge = _load_bridge()
-NPPM_GETCURRENTBUFFERID = bridge.NPPMSG + 60
-NPPM_RELOADBUFFERID = bridge.NPPMSG + 61
+NPPM_GETCURRENTBUFFERID = bridge.NPPM_GETCURRENTBUFFERID
+NPPM_RELOADBUFFERID = bridge.NPPM_RELOADBUFFERID
 OPEN_FILES: dict[str, dict[str, Any]] = {}
 LOCK = threading.RLock()
 STOP_EVENT = threading.Event()
+
+BINDING_FIELDS = (
+    "pid",
+    "top_hwnd",
+    "active_view",
+    "scintilla_hwnd",
+    "buffer_id",
+    "path",
+    "active_binding_verified",
+)
 
 
 def _json_line(payload: dict[str, Any]) -> None:
@@ -117,6 +127,57 @@ def _stat(path: str) -> dict[str, Any]:
         "mtime_ns_exact": str(st.st_mtime_ns),
         "mtime": st.st_mtime,
     }
+
+
+def _binding_result(binding: dict[str, Any] | None) -> dict[str, Any]:
+    binding = binding or {}
+    return {
+        "pid": binding.get("pid"),
+        "top_hwnd": binding.get("top_hwnd"),
+        "active_view": binding.get("active_view"),
+        "scintilla_hwnd": binding.get("scintilla_hwnd"),
+        "buffer_id": binding.get("buffer_id"),
+        "path": binding.get("path", ""),
+        "active_binding_verified": bool(binding.get("active_binding_verified", False)),
+    }
+
+
+def _capture_binding(
+    top: int,
+    *,
+    expected_path: str | None = None,
+    expected_scin: int | None = None,
+    expected_buffer_id: int | None = None,
+) -> dict[str, Any]:
+    binding = bridge.get_active_document_snapshot(top)
+    if not binding.get("active_binding_verified"):
+        raise RuntimeError(f"active Notepad++ binding was not verified: {binding}")
+    if int(binding["top_hwnd"]) != int(top):
+        raise RuntimeError(
+            f"active Notepad++ top HWND changed: expected={int(top)} actual={binding['top_hwnd']}"
+        )
+    if expected_scin is not None and int(binding["scintilla_hwnd"]) != int(expected_scin):
+        raise RuntimeError(
+            "active Scintilla HWND changed: "
+            f"expected={int(expected_scin)} actual={binding['scintilla_hwnd']}"
+        )
+    if expected_buffer_id is not None and int(binding["buffer_id"]) != int(expected_buffer_id):
+        raise RuntimeError(
+            "active Notepad++ BufferID changed: "
+            f"expected={int(expected_buffer_id)} actual={binding['buffer_id']}"
+        )
+    if expected_path is not None:
+        actual_path = str(binding.get("path") or "")
+        matches = (
+            _norm(actual_path) == _norm(expected_path)
+            if _is_real_file_path(actual_path) and _is_real_file_path(expected_path)
+            else actual_path == expected_path
+        )
+        if not matches:
+            raise RuntimeError(
+                f"active Notepad++ path changed: expected={expected_path!r} actual={actual_path!r}"
+            )
+    return binding
 
 
 def _mtime_matches(expected: Any, actual: int) -> bool:
@@ -276,21 +337,32 @@ def _read_state() -> dict[str, Any] | None:
         return None
 
 
-def _write_state(pid: int, exe: str, *, headless: bool) -> None:
+def _save_state_payload(state: dict[str, Any]) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(
-        json.dumps(
-            {
-                "state_version": OWNERSHIP_STATE_VERSION,
-                "pid": int(pid),
-                "exe": exe,
-                "headless": bool(headless),
-                "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
+    tmp = STATE_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    tmp.replace(STATE_FILE)
+
+
+def _write_state(
+    pid: int,
+    exe: str,
+    *,
+    headless: bool,
+    startup_buffer_id: int | None = None,
+    startup_path: str | None = None,
+) -> None:
+    state: dict[str, Any] = {
+        "state_version": OWNERSHIP_STATE_VERSION,
+        "pid": int(pid),
+        "exe": exe,
+        "headless": bool(headless),
+        "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    if startup_buffer_id is not None:
+        state["startup_buffer_id"] = int(startup_buffer_id)
+        state["startup_path"] = startup_path or ""
+    _save_state_payload(state)
 
 
 def _state_is_headless(state: dict[str, Any]) -> bool:
@@ -303,6 +375,34 @@ def _state_is_headless(state: dict[str, Any]) -> bool:
         return bool(bridge._is_bundled_exe(exe))
     except Exception:
         return False
+
+
+def _record_startup_placeholder_if_safe(top: int) -> dict[str, Any] | None:
+    """Persist the managed process's original empty unnamed BufferID."""
+    state = _read_state()
+    if not state or not _state_is_headless(state) or "startup_buffer_id" in state:
+        return state
+    if int(state.get("pid") or 0) != bridge.window_process_id(top):
+        return state
+
+    binding = _capture_binding(top)
+    path = str(binding.get("path") or "")
+    length = bridge.get_document_length(int(binding["scintilla_hwnd"]))
+    confirmed = _capture_binding(
+        top,
+        expected_path=path,
+        expected_scin=int(binding["scintilla_hwnd"]),
+        expected_buffer_id=int(binding["buffer_id"]),
+    )
+    if _is_real_file_path(path) or length != 0:
+        return state
+
+    state = dict(state)
+    state["state_version"] = OWNERSHIP_STATE_VERSION
+    state["startup_buffer_id"] = int(confirmed["buffer_id"])
+    state["startup_path"] = path
+    _save_state_payload(state)
+    return state
 
 
 def _clear_state() -> None:
@@ -344,7 +444,11 @@ def _ensure_npp(wait_timeout: float = 15.0) -> tuple[int, int]:
                 f"managed Notepad++ pid={state.get('pid')} is alive without a targetable window; "
                 "refusing to overwrite its ownership state"
             )
-        current = bridge.get_current_file_path(top) or ""
+        try:
+            _record_startup_placeholder_if_safe(top)
+        except Exception as exc:
+            _log(f"could not record startup buffer for pid={state.get('pid')}: {type(exc).__name__}: {exc}")
+        current = _capture_binding(top).get("path") or ""
         if (
             not _state_is_headless(state)
             and _is_real_file_path(current)
@@ -382,6 +486,10 @@ def _ensure_npp(wait_timeout: float = 15.0) -> tuple[int, int]:
         top, _ = bridge._find_pid_top(proc.pid)
         if top:
             _hide_npp(top)
+            try:
+                _record_startup_placeholder_if_safe(top)
+            except Exception as exc:
+                _log(f"could not record startup buffer for pid={proc.pid}: {type(exc).__name__}: {exc}")
             return proc.pid, top
     raise TimeoutError(f"Notepad++ MCP instance did not create a window in {wait_timeout}s (pid={proc.pid})")
 
@@ -416,6 +524,104 @@ def _post_close(top: int) -> bool:
     except Exception as exc:
         _log(f"could not post WM_CLOSE to Notepad++ hwnd={int(top)}: {type(exc).__name__}: {exc}")
         return False
+
+
+def _restore_active_buffer(top: int, original: dict[str, Any] | None) -> None:
+    if not original:
+        return
+    try:
+        current = _capture_binding(top)
+        if int(current["buffer_id"]) == int(original["buffer_id"]):
+            return
+        bridge.activate_buffer_id(top, int(original["buffer_id"]), wait_timeout=0.5)
+    except Exception as exc:
+        _log(
+            f"could not restore BufferID {original.get('buffer_id')} on hwnd={int(top)}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+
+def _cleanup_startup_placeholder(state: dict[str, Any], top: int) -> dict[str, Any]:
+    """Close only the recorded, unnamed, zero-byte startup buffer."""
+    result: dict[str, Any] = {"status": "not_recorded", "changed": False}
+    if not _state_is_headless(state):
+        result["status"] = "not_headless"
+        return result
+    startup_buffer_id = int(state.get("startup_buffer_id") or 0)
+    if not startup_buffer_id:
+        return result
+
+    result["startup_buffer_id"] = startup_buffer_id
+    original: dict[str, Any] | None = None
+    cleanup_complete = False
+    try:
+        original = _capture_binding(top)
+        binding = bridge.activate_buffer_id(top, startup_buffer_id, wait_timeout=0.5)
+        if binding is None:
+            result["status"] = "already_absent"
+            return result
+        binding = _capture_binding(
+            top,
+            expected_path=str(binding.get("path") or ""),
+            expected_scin=int(binding["scintilla_hwnd"]),
+            expected_buffer_id=startup_buffer_id,
+        )
+        result.update(_binding_result(binding))
+        path = str(binding.get("path") or "")
+        if _is_real_file_path(path):
+            result["status"] = "protected_real_file"
+            return result
+
+        scin = int(binding["scintilla_hwnd"])
+        length = bridge.get_document_length(scin)
+        binding = _capture_binding(
+            top,
+            expected_path=path,
+            expected_scin=scin,
+            expected_buffer_id=startup_buffer_id,
+        )
+        result["bytes"] = length
+        result["modified"] = _dirty(scin)
+        if length != 0:
+            result["status"] = "protected_nonempty"
+            return result
+
+        if result["modified"]:
+            if not bridge.set_document_save_point(scin):
+                result["status"] = "savepoint_failed"
+                return result
+            binding = _capture_binding(
+                top,
+                expected_path=path,
+                expected_scin=scin,
+                expected_buffer_id=startup_buffer_id,
+            )
+            if bridge.get_document_length(scin) != 0 or _dirty(scin):
+                result["status"] = "post_savepoint_validation_failed"
+                return result
+            result["savepoint_cleared"] = True
+
+        if not _close_current_tab_if_clean(
+            top,
+            scin,
+            expected_path=path,
+            expected_buffer_id=startup_buffer_id,
+        ):
+            result["status"] = "close_refused"
+            return result
+        result["status"] = "closed_empty_startup_buffer"
+        result["changed"] = True
+        cleanup_complete = True
+        return result
+    except Exception as exc:
+        result["status"] = "inspection_failed"
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        return result
+    finally:
+        if original and int(original.get("buffer_id") or 0) != startup_buffer_id:
+            _restore_active_buffer(top, original)
+        if cleanup_complete:
+            _log(f"closed empty startup BufferID {startup_buffer_id} on hwnd={int(top)}")
 
 
 def _release_managed_npp(
@@ -453,25 +659,49 @@ def _release_managed_npp(
             "reason": reason,
         }
 
+    placeholder_actions: list[dict[str, Any]] = []
+    if headless:
+        for top, _ in pairs:
+            try:
+                state = _record_startup_placeholder_if_safe(top) or state
+            except Exception as exc:
+                _log(f"could not migrate startup buffer state for pid={pid}: {type(exc).__name__}: {exc}")
+            placeholder_actions.append(_cleanup_startup_placeholder(state, top))
+        pairs = bridge._get_pid_notepadpp(pid, include_hidden=True)
+
     tracked = _load_open_files()
     dirty_paths: list[str] = []
     untracked_paths: list[str] = []
+    protected_startup_buffers: list[str] = []
     window_states: list[dict[str, Any]] = []
-    uncertain = False
-    for top, scin in pairs:
+    unsafe_placeholder_statuses = {
+        "protected_real_file",
+        "protected_nonempty",
+        "savepoint_failed",
+        "post_savepoint_validation_failed",
+        "close_refused",
+        "inspection_failed",
+    }
+    for action in placeholder_actions:
+        if action.get("status") in unsafe_placeholder_statuses:
+            protected_startup_buffers.append(
+                str(action.get("path") or f"<startup BufferID {action.get('startup_buffer_id')}>")
+            )
+    uncertain = any(action.get("status") == "inspection_failed" for action in placeholder_actions)
+    for top, _ in pairs:
         try:
-            current = bridge.get_current_file_path(top) or ""
+            binding = _capture_binding(top)
+            scin = int(binding["scintilla_hwnd"])
+            current = str(binding.get("path") or "")
             modified = _dirty(scin)
             title_dirty = _title_dirty(top)
             window_states.append({
-                "top_hwnd": int(top),
-                "scintilla_hwnd": int(scin or 0),
-                "path": current,
+                **_binding_result(binding),
                 "modified": modified,
                 "title_dirty": title_dirty,
             })
             if modified:
-                dirty_paths.append(current if _is_real_file_path(current) else "<unknown>")
+                dirty_paths.append(current or "<unknown>")
             if _is_real_file_path(current) and _norm(current) not in tracked:
                 untracked_paths.append(current)
         except Exception as exc:
@@ -486,7 +716,13 @@ def _release_managed_npp(
     dirty_paths = list(dict.fromkeys(dirty_paths))
     untracked_paths = list(dict.fromkeys(untracked_paths))
     dirty = bool(dirty_paths)
-    must_retain = dirty or uncertain or (preserve_untracked and bool(untracked_paths)) or not close_clean
+    must_retain = (
+        dirty
+        or uncertain
+        or bool(protected_startup_buffers)
+        or (preserve_untracked and bool(untracked_paths))
+        or not close_clean
+    )
     close_posted: list[bool] = []
     if not must_retain:
         close_posted = [_post_close(top) for top, _ in pairs]
@@ -500,6 +736,13 @@ def _release_managed_npp(
                 "status": "closed",
                 "pid": pid,
                 "headless": headless,
+                "dirty": dirty,
+                "dirty_paths": dirty_paths,
+                "uncertain": uncertain,
+                "untracked_paths": untracked_paths,
+                "window_states": window_states,
+                "placeholder_actions": placeholder_actions,
+                "protected_startup_buffers": protected_startup_buffers,
                 "close_posted": close_posted,
                 "safe_to_forget": True,
                 "reason": reason,
@@ -519,6 +762,8 @@ def _release_managed_npp(
             "uncertain": uncertain,
             "untracked_paths": untracked_paths,
             "window_states": window_states,
+            "placeholder_actions": placeholder_actions,
+            "protected_startup_buffers": protected_startup_buffers,
             "close_posted": close_posted,
             "close_timeout": bool(close_posted),
             "safe_to_forget": False,
@@ -538,6 +783,8 @@ def _release_managed_npp(
             "uncertain": uncertain,
             "untracked_paths": untracked_paths,
             "window_states": window_states,
+            "placeholder_actions": placeholder_actions,
+            "protected_startup_buffers": protected_startup_buffers,
             "close_posted": close_posted,
             "safe_to_forget": True,
             "reason": reason,
@@ -552,6 +799,8 @@ def _release_managed_npp(
         "uncertain": uncertain,
         "untracked_paths": untracked_paths,
         "window_states": window_states,
+        "placeholder_actions": placeholder_actions,
+        "protected_startup_buffers": protected_startup_buffers,
         "close_posted": close_posted,
         "visible": visible,
         "safe_to_forget": False,
@@ -575,14 +824,24 @@ def _activate(path: str, wait_timeout: float = 15.0) -> tuple[int, int, str]:
     expected = _norm(path_abs)
     pid, top = _ensure_npp(wait_timeout)
 
+    last_path = ""
+
     def active_target() -> tuple[int, int] | None:
-        for top_hwnd, scin in bridge._get_pid_notepadpp(pid, include_hidden=True):
-            if not scin:
+        nonlocal last_path
+        seen: set[int] = set()
+        for top_hwnd, _ in bridge._get_pid_notepadpp(pid, include_hidden=True):
+            if int(top_hwnd) in seen:
                 continue
-            current = bridge.get_current_file_path(top_hwnd)
+            seen.add(int(top_hwnd))
+            try:
+                binding = _capture_binding(top_hwnd)
+            except Exception:
+                continue
+            current = str(binding.get("path") or "")
+            last_path = current or last_path
             if current and _norm(current) == expected:
                 _hide_npp(top_hwnd)
-                return top_hwnd, scin
+                return top_hwnd, int(binding["scintilla_hwnd"])
         return None
 
     active = active_target()
@@ -600,18 +859,13 @@ def _activate(path: str, wait_timeout: float = 15.0) -> tuple[int, int, str]:
 
     bridge._npp_doopen(top, path_abs)
     deadline = time.time() + wait_timeout
-    last_path = ""
     while time.time() < deadline:
         time.sleep(0.1)
-        for top_hwnd, scin in bridge._get_pid_notepadpp(pid, include_hidden=True):
-            if not scin:
-                continue
+        for top_hwnd, _ in bridge._get_pid_notepadpp(pid, include_hidden=True):
             bridge.switch_to_file_by_path(top_hwnd, path_abs)
-            current = bridge.get_current_file_path(top_hwnd)
-            last_path = current or last_path
-            if current and _norm(current) == expected:
-                _hide_npp(top_hwnd)
-                return top_hwnd, scin, path_abs
+        active = active_target()
+        if active:
+            return active[0], active[1], path_abs
     raise TimeoutError(f"Notepad++ did not activate target file. expected={path_abs!r} current={last_path!r}")
 
 
@@ -623,20 +877,48 @@ def _dirty(scin: int) -> bool:
     return bool(bridge.is_document_modified(scin))
 
 
-def _dirty_diagnostics(top: int, scin: int) -> dict[str, Any]:
+def _dirty_diagnostics(
+    top: int,
+    scin: int,
+    *,
+    expected_path: str | None = None,
+    expected_buffer_id: int | None = None,
+) -> dict[str, Any]:
+    if expected_path is None and expected_buffer_id is None:
+        return {
+            "modified": _dirty(scin),
+            "title_dirty": _title_dirty(top),
+        }
+    binding = _capture_binding(
+        top,
+        expected_path=expected_path,
+        expected_scin=scin,
+        expected_buffer_id=expected_buffer_id,
+    )
+    modified = _dirty(int(binding["scintilla_hwnd"]))
+    title_dirty = _title_dirty(top)
+    binding = _capture_binding(
+        top,
+        expected_path=expected_path,
+        expected_scin=scin,
+        expected_buffer_id=int(binding["buffer_id"]),
+    )
     return {
-        "modified": _dirty(scin),
-        "title_dirty": _title_dirty(top),
+        "modified": modified,
+        "title_dirty": title_dirty,
+        "binding": binding,
     }
 
 
-def _reload_current(top: int, path: str) -> int:
+def _reload_current(top: int, path: str, expected_buffer_id: int | None = None) -> int:
     ok, current = bridge.ensure_current_path(top, path)
     if not ok:
         raise RuntimeError(f"cannot reload a non-current path: expected={path!r} current={current!r}")
-    buffer_id = int(bridge.u32.SendMessageW(top, NPPM_GETCURRENTBUFFERID, 0, 0))
-    if not buffer_id:
-        raise RuntimeError("Notepad++ returned an invalid current BufferID")
+    buffer_id = bridge.get_current_buffer_id(top)
+    if expected_buffer_id is not None and buffer_id != int(expected_buffer_id):
+        raise RuntimeError(
+            f"current BufferID changed before reload: expected={int(expected_buffer_id)} actual={buffer_id}"
+        )
     ret = int(bridge.u32.SendMessageW(top, NPPM_RELOADBUFFERID, buffer_id, 0))
     time.sleep(0.25)
     return ret
@@ -655,6 +937,9 @@ def _record(path: str, top: int, scin: int, meta: dict[str, Any]) -> None:
         "source": meta.get("source", _stat(path)),
         "last_seen": time.time(),
     }
+    binding = meta.get("binding")
+    if binding:
+        entry.update({name: binding.get(name) for name in BINDING_FIELDS})
     for name in (
         "operation",
         "dirty_origin",
@@ -680,7 +965,7 @@ def _record_hidden_quarantine(
     reason: str,
 ) -> dict[str, Any]:
     try:
-        diagnostics = _dirty_diagnostics(top, scin)
+        diagnostics = _dirty_diagnostics(top, scin, expected_path=path)
     except Exception as exc:
         diagnostics = {"modified": True, "title_dirty": False}
         reason = f"{reason}; dirty inspection failed: {type(exc).__name__}: {exc}"
@@ -698,6 +983,7 @@ def _record_hidden_quarantine(
         "reload_allowed": reload_allowed,
         "mutation_started": mutation_started,
         "quarantine_reason": reason,
+        "binding": diagnostics.get("binding"),
     })
     _hide_npp(top)
     return _release_managed_npp(
@@ -713,12 +999,23 @@ def _reload_and_validate(
     top: int,
     scin: int,
     source_before: dict[str, Any],
+    binding: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    if not _reload_current(top, path):
+    binding = binding or _capture_binding(top, expected_path=path, expected_scin=scin)
+    binding = _capture_binding(
+        top,
+        expected_path=path,
+        expected_scin=scin,
+        expected_buffer_id=int(binding["buffer_id"]),
+    )
+    if not _reload_current(top, path, expected_buffer_id=int(binding["buffer_id"])):
         raise RuntimeError("Notepad++ rejected NPPM_RELOADBUFFERID")
-    ok, current = bridge.ensure_current_path(top, path)
-    if not ok:
-        raise RuntimeError(f"active path changed during reload: expected={path!r} current={current!r}")
+    binding = _capture_binding(
+        top,
+        expected_path=path,
+        expected_scin=scin,
+        expected_buffer_id=int(binding["buffer_id"]),
+    )
     source_after = _stat(path)
     time.sleep(0.05)
     source_stable = _stat(path)
@@ -729,7 +1026,13 @@ def _reload_and_validate(
         or source_after["size"] != source_stable["size"]
     ):
         raise RuntimeError("source changed while the managed buffer was being reloaded")
-    if _dirty(scin):
+    diagnostics = _dirty_diagnostics(
+        top,
+        scin,
+        expected_path=path,
+        expected_buffer_id=int(binding["buffer_id"]),
+    )
+    if diagnostics["modified"]:
         raise RuntimeError("Scintilla remained modified after NPPM_RELOADBUFFERID")
     return source_stable
 
@@ -744,10 +1047,17 @@ def _prepare_document(
     operation: str,
 ) -> dict[str, Any]:
     key = _norm(path)
+    binding = _capture_binding(top, expected_path=path, expected_scin=scin)
     current_stat = _stat(path)
     previous = _load_open_files().get(key)
     external_changed = bool(previous and previous.get("source", {}).get("mtime_ns") != current_stat["mtime_ns"])
-    diagnostics = _dirty_diagnostics(top, scin)
+    diagnostics = _dirty_diagnostics(
+        top,
+        scin,
+        expected_path=path,
+        expected_buffer_id=int(binding["buffer_id"]),
+    )
+    binding = diagnostics.get("binding", binding)
     dirty = diagnostics["modified"]
     reloaded = False
     dirty_recovered = False
@@ -782,7 +1092,7 @@ def _prepare_document(
         )
         if read_only and auto_reload and not prior_write_quarantine:
             try:
-                current_stat = _reload_and_validate(path, top, scin, current_stat)
+                current_stat = _reload_and_validate(path, top, scin, current_stat, binding)
             except Exception as exc:
                 reason = f"read-only dirty recovery failed: {type(exc).__name__}: {exc}"
                 _record_hidden_quarantine(
@@ -799,7 +1109,19 @@ def _prepare_document(
             reloaded = True
             dirty_recovered = True
             dirty = False
-            diagnostics = _dirty_diagnostics(top, scin)
+            binding = _capture_binding(
+                top,
+                expected_path=path,
+                expected_scin=scin,
+                expected_buffer_id=int(binding["buffer_id"]),
+            )
+            diagnostics = _dirty_diagnostics(
+                top,
+                scin,
+                expected_path=path,
+                expected_buffer_id=int(binding["buffer_id"]),
+            )
+            binding = diagnostics.get("binding", binding)
             _forget(path)
         else:
             reason = (
@@ -820,7 +1142,7 @@ def _prepare_document(
             raise RuntimeError(reason)
     elif external_changed and auto_reload:
         try:
-            current_stat = _reload_and_validate(path, top, scin, current_stat)
+            current_stat = _reload_and_validate(path, top, scin, current_stat, binding)
         except Exception as exc:
             reason = f"external-change reload failed: {type(exc).__name__}: {exc}"
             _record_hidden_quarantine(
@@ -835,7 +1157,19 @@ def _prepare_document(
             )
             raise RuntimeError(reason) from exc
         reloaded = True
-        diagnostics = _dirty_diagnostics(top, scin)
+        binding = _capture_binding(
+            top,
+            expected_path=path,
+            expected_scin=scin,
+            expected_buffer_id=int(binding["buffer_id"]),
+        )
+        diagnostics = _dirty_diagnostics(
+            top,
+            scin,
+            expected_path=path,
+            expected_buffer_id=int(binding["buffer_id"]),
+        )
+        binding = diagnostics.get("binding", binding)
 
     return {
         "dirty": dirty,
@@ -848,14 +1182,37 @@ def _prepare_document(
         "reload_allowed": read_only,
         "mutation_started": False,
         "source": current_stat,
+        "binding": binding,
     }
 
 
-def _read_buffer_snapshot(scin: int) -> dict[str, Any]:
+def _read_buffer_snapshot(
+    scin: int,
+    *,
+    top: int | None = None,
+    expected_path: str | None = None,
+    expected_buffer_id: int | None = None,
+) -> dict[str, Any]:
+    binding = None
+    if top is not None:
+        binding = _capture_binding(
+            top,
+            expected_path=expected_path,
+            expected_scin=scin,
+            expected_buffer_id=expected_buffer_id,
+        )
+        scin = int(binding["scintilla_hwnd"])
     data = bridge.read_document_bytes(scin)
     code_page = bridge.get_code_page(scin)
     text, encoding, had_decode_errors = bridge.decode_document_bytes(data, code_page)
-    return {
+    if top is not None:
+        binding = _capture_binding(
+            top,
+            expected_path=expected_path,
+            expected_scin=scin,
+            expected_buffer_id=int(binding["buffer_id"]),
+        )
+    result = {
         "data": data,
         "text": text,
         "code_page": code_page,
@@ -864,15 +1221,34 @@ def _read_buffer_snapshot(scin: int) -> dict[str, Any]:
         "byte_info": bridge.inspect_document_bytes(data),
         "sha256": _sha256_hex(data),
     }
+    if binding:
+        result["binding"] = binding
+    return result
 
 
 def _finish_read_tab(path_abs: str, top: int, scin: int, meta: dict[str, Any]) -> dict[str, Any]:
     meta["source"] = _stat(path_abs)
-    diagnostics = _dirty_diagnostics(top, scin)
+    binding = meta.get("binding")
+    if binding:
+        diagnostics = _dirty_diagnostics(
+            top,
+            scin,
+            expected_path=path_abs,
+            expected_buffer_id=int(binding["buffer_id"]),
+        )
+        binding = diagnostics.get("binding", binding)
+        meta["binding"] = binding
+    else:
+        diagnostics = _dirty_diagnostics(top, scin)
     meta["dirty"] = diagnostics["modified"]
     meta["buffer_modified"] = diagnostics["modified"]
     meta["title_dirty"] = diagnostics["title_dirty"]
-    tab_closed = _close_current_tab_if_clean(top, scin)
+    tab_closed = _close_current_tab_if_clean(
+        top,
+        scin,
+        expected_path=path_abs if binding else None,
+        expected_buffer_id=int(binding["buffer_id"]) if binding else None,
+    )
     if tab_closed:
         _forget(path_abs)
         lifecycle = _close_managed_npp_if_idle(top)
@@ -885,7 +1261,11 @@ def _finish_read_tab(path_abs: str, top: int, scin: int, meta: dict[str, Any]) -
             close_clean=True,
             preserve_untracked=False,
         )
-    return {"tab_closed": tab_closed, "lifecycle": lifecycle}
+    return {
+        "tab_closed": tab_closed,
+        "lifecycle": lifecycle,
+        **_binding_result(binding),
+    }
 
 
 def _persist_and_verify(
@@ -900,8 +1280,28 @@ def _persist_and_verify(
     byte_info: dict[str, Any],
 ) -> dict[str, Any]:
     """Save a validated buffer, reopen it through Notepad++, and compare bytes."""
+    binding = _capture_binding(top, expected_path=path_abs, expected_scin=scin)
+    buffer_id = int(binding["buffer_id"])
+    binding = _capture_binding(
+        top,
+        expected_path=path_abs,
+        expected_scin=scin,
+        expected_buffer_id=buffer_id,
+    )
     written = bridge.write_document_bytes(scin, data)
+    binding = _capture_binding(
+        top,
+        expected_path=path_abs,
+        expected_scin=scin,
+        expected_buffer_id=buffer_id,
+    )
     buffer_verified = bridge.read_document_bytes(scin) == data
+    binding = _capture_binding(
+        top,
+        expected_path=path_abs,
+        expected_scin=scin,
+        expected_buffer_id=buffer_id,
+    )
     if not buffer_verified:
         raise RuntimeError(
             f"Scintilla buffer verification failed after writing {written} bytes"
@@ -913,6 +1313,12 @@ def _persist_and_verify(
             "source changed after Scintilla buffer preparation and before save; "
             "refusing to overwrite the external change"
         )
+    binding = _capture_binding(
+        top,
+        expected_path=path_abs,
+        expected_scin=scin,
+        expected_buffer_id=buffer_id,
+    )
 
     save_ok = False
     save_error = None
@@ -922,7 +1328,13 @@ def _persist_and_verify(
         save_error = f"{type(exc).__name__}: {exc}"
     time.sleep(0.2)
     after = _stat(path_abs)
-    diagnostics = _dirty_diagnostics(top, scin)
+    diagnostics = _dirty_diagnostics(
+        top,
+        scin,
+        expected_path=path_abs,
+        expected_buffer_id=buffer_id,
+    )
+    binding = diagnostics.get("binding", binding)
     buffer_clean = not diagnostics["modified"]
     title_clean = not diagnostics["title_dirty"]
     disk_changed = (after["mtime_ns"] != before["mtime_ns"]) or (after["size"] != before["size"])
@@ -950,6 +1362,7 @@ def _persist_and_verify(
         "readback_exact": False,
         "source_stable": False,
         "verification_error": None,
+        **_binding_result(binding),
     }
 
     if not save_confirmed:
@@ -967,7 +1380,12 @@ def _persist_and_verify(
         result["warning"] = "Save was not fully confirmed; the managed buffer remains quarantined."
         return result
 
-    if not _close_current_tab_if_clean(top, scin):
+    if not _close_current_tab_if_clean(
+        top,
+        scin,
+        expected_path=path_abs,
+        expected_buffer_id=buffer_id,
+    ):
         result["verification_error"] = "saved buffer could not be closed cleanly for readback"
         result["lifecycle"] = _record_hidden_quarantine(
             path_abs,
@@ -986,7 +1404,18 @@ def _persist_and_verify(
     verify_scin = None
     try:
         verify_top, verify_scin, _ = _activate(path_abs, wait_timeout)
-        verify_snapshot = _read_buffer_snapshot(verify_scin)
+        verify_binding = _capture_binding(
+            verify_top,
+            expected_path=path_abs,
+            expected_scin=verify_scin,
+        )
+        verify_snapshot = _read_buffer_snapshot(
+            verify_scin,
+            top=verify_top,
+            expected_path=path_abs,
+            expected_buffer_id=int(verify_binding["buffer_id"]),
+        )
+        verify_binding = verify_snapshot["binding"]
         verify_source = _stat(path_abs)
         time.sleep(0.2)
         stable_source = _stat(path_abs)
@@ -1017,6 +1446,7 @@ def _persist_and_verify(
             "reload_allowed": False,
             "mutation_started": True,
             "source": stable_source,
+            "binding": verify_binding,
         }
         if result["ok"]:
             result.update(_finish_read_tab(path_abs, verify_top, verify_scin, verify_meta))
@@ -1054,14 +1484,50 @@ def _forget(path: str) -> None:
     _save_open_files(files)
 
 
-def _close_current_tab_if_clean(top: int, scin: int) -> bool:
+def _close_current_tab_if_clean(
+    top: int,
+    scin: int,
+    *,
+    expected_path: str | None = None,
+    expected_buffer_id: int | None = None,
+    close_timeout: float = 1.0,
+) -> bool:
+    binding = _capture_binding(
+        top,
+        expected_path=expected_path,
+        expected_scin=scin,
+        expected_buffer_id=expected_buffer_id,
+    )
+    scin = int(binding["scintilla_hwnd"])
+    buffer_id = int(binding["buffer_id"])
+    pid = int(binding["pid"])
     if _dirty(scin):
         return False
+    _capture_binding(
+        top,
+        expected_path=expected_path,
+        expected_scin=scin,
+        expected_buffer_id=buffer_id,
+    )
     WM_COMMAND = 0x0111
     IDM_FILE_CLOSE = 41003
     bridge.u32.SendMessageW(top, WM_COMMAND, IDM_FILE_CLOSE, 0)
-    time.sleep(0.15)
-    return True
+
+    deadline = time.monotonic() + max(0.0, float(close_timeout))
+    while True:
+        if not bridge.u32.IsWindow(top) or bridge.window_process_id(top) != pid:
+            return True
+        try:
+            if bridge.get_buffer_position(top, buffer_id) is None:
+                post_close = _capture_binding(top)
+                if int(post_close["buffer_id"]) != buffer_id:
+                    return True
+        except Exception:
+            if not bridge.u32.IsWindow(top) or not bridge._is_pid_alive(pid):
+                return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
 
 
 def _reset_npp_state() -> None:
@@ -1116,7 +1582,19 @@ def dgs_open_file(args: dict[str, Any]) -> dict[str, Any]:
         if not ok:
             raise RuntimeError(f"active Notepad++ tab mismatch: expected={path_abs!r} current={current!r}")
         meta["source"] = _stat(path_abs)
-        code_page = bridge.get_code_page(scin)
+        binding = _capture_binding(
+            top,
+            expected_path=path_abs,
+            expected_scin=scin,
+            expected_buffer_id=int(meta["binding"]["buffer_id"]),
+        )
+        code_page = bridge.get_code_page(int(binding["scintilla_hwnd"]))
+        meta["binding"] = _capture_binding(
+            top,
+            expected_path=path_abs,
+            expected_scin=scin,
+            expected_buffer_id=int(binding["buffer_id"]),
+        )
         result = {
             "ok": True,
             "path": path_abs,
@@ -1151,7 +1629,13 @@ def dgs_read_file(args: dict[str, Any]) -> dict[str, Any]:
             read_only=True,
             operation="dgs_read_file",
         )
-        snapshot = _read_buffer_snapshot(scin)
+        snapshot = _read_buffer_snapshot(
+            scin,
+            top=top,
+            expected_path=path_abs,
+            expected_buffer_id=int(meta["binding"]["buffer_id"]),
+        )
+        meta["binding"] = snapshot["binding"]
         data = snapshot["data"]
         text = snapshot["text"]
         code_page = snapshot["code_page"]
@@ -1221,7 +1705,13 @@ def dgs_write_file(args: dict[str, Any]) -> dict[str, Any]:
                 f"expected_mtime_ns={expected_mtime_ns}, current_mtime_ns={before['mtime_ns_exact']}"
             )
 
-        original = _read_buffer_snapshot(scin)
+        original = _read_buffer_snapshot(
+            scin,
+            top=top,
+            expected_path=path_abs,
+            expected_buffer_id=int(meta["binding"]["buffer_id"]),
+        )
+        meta["binding"] = original["binding"]
         if expected_sha256 is not None and str(expected_sha256).lower() != original["sha256"]:
             raise RuntimeError(
                 "document content changed before write: "
@@ -1257,7 +1747,13 @@ def dgs_write_file(args: dict[str, Any]) -> dict[str, Any]:
         prewrite = _stat(path_abs)
         if prewrite["mtime_ns"] != before["mtime_ns"] or prewrite["size"] != before["size"]:
             raise RuntimeError("source changed during write preparation; refusing full replacement")
-        current = _read_buffer_snapshot(scin)
+        current = _read_buffer_snapshot(
+            scin,
+            top=top,
+            expected_path=path_abs,
+            expected_buffer_id=int(meta["binding"]["buffer_id"]),
+        )
+        meta["binding"] = current["binding"]
         if current["sha256"] != original["sha256"]:
             raise RuntimeError("Scintilla buffer changed during write preparation; refusing full replacement")
 
@@ -1292,6 +1788,7 @@ def dgs_write_file(args: dict[str, Any]) -> dict[str, Any]:
                 "buffer_mutated": True,
                 "mutation_started": True,
                 "lifecycle": lifecycle,
+                **_binding_result(meta.get("binding")),
             }
         result["changed"] = True
         result["before_content_sha256"] = original["sha256"]
@@ -1318,7 +1815,13 @@ def dgs_search(args: dict[str, Any]) -> dict[str, Any]:
             read_only=True,
             operation="dgs_search",
         )
-        snapshot = _read_buffer_snapshot(scin)
+        snapshot = _read_buffer_snapshot(
+            scin,
+            top=top,
+            expected_path=path_abs,
+            expected_buffer_id=int(meta["binding"]["buffer_id"]),
+        )
+        meta["binding"] = snapshot["binding"]
         search = _search_text(
             snapshot["text"],
             query,
@@ -1390,7 +1893,13 @@ def dgs_apply_patch(args: dict[str, Any]) -> dict[str, Any]:
                 f"expected_mtime_ns={expected_mtime_ns}, current_mtime_ns={before['mtime_ns_exact']}"
             )
 
-        original = _read_buffer_snapshot(scin)
+        original = _read_buffer_snapshot(
+            scin,
+            top=top,
+            expected_path=path_abs,
+            expected_buffer_id=int(meta["binding"]["buffer_id"]),
+        )
+        meta["binding"] = original["binding"]
         if str(expected_sha256).lower() != original["sha256"]:
             raise RuntimeError(
                 "document content changed before patch: "
@@ -1457,7 +1966,13 @@ def dgs_apply_patch(args: dict[str, Any]) -> dict[str, Any]:
         prewrite = _stat(path_abs)
         if prewrite["mtime_ns"] != before["mtime_ns"] or prewrite["size"] != before["size"]:
             raise RuntimeError("source changed during patch preparation; refusing to write")
-        current = _read_buffer_snapshot(scin)
+        current = _read_buffer_snapshot(
+            scin,
+            top=top,
+            expected_path=path_abs,
+            expected_buffer_id=int(meta["binding"]["buffer_id"]),
+        )
+        meta["binding"] = current["binding"]
         if current["sha256"] != original["sha256"]:
             raise RuntimeError("Scintilla buffer changed during patch preparation; refusing to write")
 
@@ -1481,6 +1996,7 @@ def dgs_apply_patch(args: dict[str, Any]) -> dict[str, Any]:
                 "changed": False,
                 "buffer_mutated": True,
                 "mutation_started": True,
+                **_binding_result(meta.get("binding")),
                 "lifecycle": _record_hidden_quarantine(
                     path_abs,
                     top,
@@ -1518,16 +2034,33 @@ def dgs_list_open_files(args: dict[str, Any]) -> dict[str, Any]:
             items.append(live)
         state = _read_state()
         ownership = None
+        binding = None
         if state:
             pid = int(state.get("pid") or 0)
+            alive = bridge._is_pid_alive(pid)
             ownership = {
                 "pid": pid,
                 "exe": state.get("exe"),
                 "headless": _state_is_headless(state),
-                "alive": bridge._is_pid_alive(pid),
+                "alive": alive,
                 "started_at": state.get("started_at"),
+                "startup_buffer_id": state.get("startup_buffer_id"),
             }
-        return {"ok": True, "count": len(items), "files": items, "ownership": ownership}
+            if alive:
+                try:
+                    top, _ = bridge._find_pid_top(pid)
+                    if top:
+                        binding = _capture_binding(top)
+                        ownership["binding"] = _binding_result(binding)
+                except Exception as exc:
+                    ownership["binding_error"] = f"{type(exc).__name__}: {exc}"
+        return {
+            "ok": True,
+            "count": len(items),
+            "files": items,
+            "ownership": ownership,
+            **_binding_result(binding),
+        }
 
 
 def dgs_shutdown(args: dict[str, Any]) -> dict[str, Any]:
@@ -1538,10 +2071,26 @@ def dgs_shutdown(args: dict[str, Any]) -> dict[str, Any]:
             close_clean=True,
             preserve_untracked=True,
         )
+        binding = None
+        window_states = result.get("window_states") or []
+        if window_states:
+            binding = window_states[0]
+        elif result.get("placeholder_actions"):
+            binding = next(
+                (
+                    action
+                    for action in result["placeholder_actions"]
+                    if action.get("active_binding_verified")
+                ),
+                None,
+            )
+        if binding is None and result.get("pid"):
+            binding = {"pid": result["pid"]}
         return {
             "ok": result["safe_to_forget"],
             "safe_to_stop": result["safe_to_forget"],
             "lifecycle": result,
+            **_binding_result(binding),
         }
 
 

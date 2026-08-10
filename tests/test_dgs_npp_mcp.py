@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -14,6 +15,26 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import broker  # noqa: E402
+
+
+def active_binding(
+    path: str = r"C:\work\target.cpp",
+    *,
+    pid: int = 4242,
+    top: int = 101,
+    scin: int = 201,
+    buffer_id: int = 123456,
+    view: int = 0,
+) -> dict:
+    return {
+        "pid": pid,
+        "top_hwnd": top,
+        "active_view": view,
+        "scintilla_hwnd": scin,
+        "buffer_id": buffer_id,
+        "path": path,
+        "active_binding_verified": True,
+    }
 
 
 class BridgeContractTests(unittest.TestCase):
@@ -34,6 +55,149 @@ class BridgeContractTests(unittest.TestCase):
     def test_unexpected_binary_profile_detection_is_preserved(self) -> None:
         self.assertFalse(broker.bridge.has_unexpected_binary_profile(b"ordinary document text\n"))
         self.assertTrue(broker.bridge.has_unexpected_binary_profile(bytes(range(256)) * 256))
+
+
+class ActiveBindingBridgeTests(unittest.TestCase):
+    def test_official_active_view_selects_empty_sub_view_without_length_heuristic(self) -> None:
+        with (
+            mock.patch.object(
+                broker.bridge,
+                "send_npp_int_out_message",
+                return_value=broker.bridge.SUB_VIEW,
+            ),
+            mock.patch.object(
+                broker.bridge,
+                "_editor_view_map",
+                return_value={broker.bridge.MAIN_VIEW: 201, broker.bridge.SUB_VIEW: 202},
+            ),
+            mock.patch.object(broker.bridge, "window_process_id", return_value=4242),
+            mock.patch.object(broker.bridge.u32, "IsWindowVisible") as visible,
+            mock.patch.object(broker.bridge.u32, "SendMessageW") as send,
+        ):
+            view, scin = broker.bridge.get_active_scintilla(101)
+
+        self.assertEqual((view, scin), (broker.bridge.SUB_VIEW, 202))
+        visible.assert_not_called()
+        send.assert_not_called()
+
+    def test_editor_view_discovery_ignores_two_auxiliary_scintillas(self) -> None:
+        with (
+            mock.patch.object(broker.bridge, "_scintilla_children", return_value=[201, 202, 203, 204]),
+            mock.patch.object(
+                broker.bridge,
+                "_has_editor_border",
+                side_effect=lambda hwnd: hwnd in {201, 202},
+            ),
+        ):
+            result = broker.bridge._discover_editor_view_map(101)
+
+        self.assertEqual(
+            result,
+            {broker.bridge.MAIN_VIEW: 201, broker.bridge.SUB_VIEW: 202},
+        )
+
+    def test_active_document_snapshot_retries_when_path_and_buffer_change(self) -> None:
+        with (
+            mock.patch.object(
+                broker.bridge,
+                "get_current_file_path_strict",
+                side_effect=["old.cpp", "new.cpp", "new.cpp", "new.cpp"],
+            ),
+            mock.patch.object(
+                broker.bridge,
+                "get_current_buffer_id",
+                side_effect=[11, 12, 12, 12],
+            ),
+            mock.patch.object(broker.bridge, "get_active_scintilla", return_value=(0, 201)),
+            mock.patch.object(broker.bridge, "window_process_id", return_value=4242),
+            mock.patch("time.sleep") as sleep,
+        ):
+            result = broker.bridge.get_active_document_snapshot(101, retries=2)
+
+        self.assertEqual(result["path"], "new.cpp")
+        self.assertEqual(result["buffer_id"], 12)
+        self.assertTrue(result["active_binding_verified"])
+        sleep.assert_called_once_with(0.05)
+
+    def test_active_scintilla_rejects_a_child_from_another_pid(self) -> None:
+        with (
+            mock.patch.object(broker.bridge, "send_npp_int_out_message", return_value=0),
+            mock.patch.object(
+                broker.bridge,
+                "_editor_view_map",
+                return_value={broker.bridge.MAIN_VIEW: 201, broker.bridge.SUB_VIEW: 202},
+            ),
+            mock.patch.object(
+                broker.bridge,
+                "window_process_id",
+                side_effect=lambda hwnd: 4242 if hwnd == 101 else 9999,
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "PID mismatch"):
+                broker.bridge.get_active_scintilla(101)
+
+    def test_buffer_read_stops_if_buffer_id_changes(self) -> None:
+        before = active_binding(buffer_id=11)
+        after = active_binding(buffer_id=12)
+        with (
+            mock.patch.object(
+                broker.bridge,
+                "get_active_document_snapshot",
+                side_effect=[before, after],
+            ),
+            mock.patch.object(broker.bridge, "read_document_bytes", return_value=b"text"),
+            mock.patch.object(broker.bridge, "get_code_page", return_value=65001),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "BufferID changed"):
+                broker._read_buffer_snapshot(
+                    201,
+                    top=101,
+                    expected_path=r"C:\work\target.cpp",
+                    expected_buffer_id=11,
+                )
+
+    def test_clean_close_is_confirmed_when_target_buffer_disappears(self) -> None:
+        before = active_binding(buffer_id=11)
+        after = active_binding(buffer_id=12)
+        with (
+            mock.patch.object(broker, "_capture_binding", side_effect=[before, before, after]) as capture,
+            mock.patch.object(broker, "_dirty", return_value=False),
+            mock.patch.object(broker.bridge.u32, "SendMessageW") as send,
+            mock.patch.object(broker.bridge.u32, "IsWindow", return_value=True),
+            mock.patch.object(broker.bridge, "window_process_id", return_value=before["pid"]),
+            mock.patch.object(broker.bridge, "get_buffer_position", return_value=None),
+        ):
+            closed = broker._close_current_tab_if_clean(
+                before["top_hwnd"],
+                before["scintilla_hwnd"],
+                expected_path=before["path"],
+                expected_buffer_id=before["buffer_id"],
+                close_timeout=0,
+            )
+
+        self.assertTrue(closed)
+        self.assertEqual(capture.call_count, 3)
+        send.assert_called_once_with(before["top_hwnd"], 0x0111, 41003, 0)
+
+    def test_clean_close_is_refused_when_target_buffer_remains_open(self) -> None:
+        binding = active_binding(buffer_id=11)
+        with (
+            mock.patch.object(broker, "_capture_binding", side_effect=[binding, binding]),
+            mock.patch.object(broker, "_dirty", return_value=False),
+            mock.patch.object(broker.bridge.u32, "SendMessageW"),
+            mock.patch.object(broker.bridge.u32, "IsWindow", return_value=True),
+            mock.patch.object(broker.bridge, "window_process_id", return_value=binding["pid"]),
+            mock.patch.object(broker.bridge, "get_buffer_position", return_value=(binding["active_view"], 0)),
+        ):
+            closed = broker._close_current_tab_if_clean(
+                binding["top_hwnd"],
+                binding["scintilla_hwnd"],
+                expected_path=binding["path"],
+                expected_buffer_id=binding["buffer_id"],
+                close_timeout=0,
+            )
+
+        self.assertFalse(closed)
 
 
 class MtimeTests(unittest.TestCase):
@@ -132,6 +296,11 @@ class PersistConcurrencyTests(unittest.TestCase):
         data = b"updated\n"
         before = {"mtime_ns": 100, "size": 8}
         with (
+            mock.patch.object(
+                broker,
+                "_capture_binding",
+                return_value=active_binding(path="target.cpp"),
+            ),
             mock.patch.object(broker.bridge, "write_document_bytes", return_value=len(data)),
             mock.patch.object(broker.bridge, "read_document_bytes", return_value=data),
             mock.patch.object(broker, "_stat", return_value={"mtime_ns": 101, "size": 9}),
@@ -210,6 +379,7 @@ class MutationRetryTests(unittest.TestCase):
             "had_decode_errors": False,
             "byte_info": {"bom": "none", "newline": "none", "newline_counts": {}},
             "sha256": broker._sha256_hex(b"old"),
+            "binding": active_binding(),
         }
         lifecycle = {"status": "quarantined_hidden", "safe_to_forget": False}
         meta = {
@@ -219,6 +389,7 @@ class MutationRetryTests(unittest.TestCase):
             "auto_reloaded": False,
             "dirty_recovered": False,
             "source": source,
+            "binding": active_binding(),
         }
         with (
             mock.patch.object(broker, "_activate", return_value=(101, 201, r"C:\work\target.cpp")),
@@ -253,6 +424,7 @@ class DirtyRecoveryTests(unittest.TestCase):
     def test_read_only_dirty_buffer_reloads_once_and_continues(self) -> None:
         source = {"mtime_ns": 100, "size": 3}
         with (
+            mock.patch.object(broker, "_capture_binding", return_value=active_binding()),
             mock.patch.object(broker, "_stat", return_value=source),
             mock.patch.object(broker, "_load_open_files", return_value={}),
             mock.patch.object(
@@ -284,10 +456,11 @@ class DirtyRecoveryTests(unittest.TestCase):
     def test_reloadbuffer_result_is_verified_with_scintilla_state(self) -> None:
         source = {"mtime_ns": 100, "size": 3}
         with (
+            mock.patch.object(broker, "_capture_binding", return_value=active_binding()),
             mock.patch.object(broker, "_reload_current", return_value=1) as reload_current,
-            mock.patch.object(broker.bridge, "ensure_current_path", return_value=(True, r"C:\work\target.cpp")),
             mock.patch.object(broker, "_stat", return_value=source),
             mock.patch.object(broker, "_dirty", return_value=False),
+            mock.patch.object(broker, "_title_dirty", return_value=False),
         ):
             result = broker._reload_and_validate(r"C:\work\target.cpp", 101, 201, source)
 
@@ -313,6 +486,7 @@ class DirtyRecoveryTests(unittest.TestCase):
         source = {"mtime_ns": 100, "size": 3}
         lifecycle = {"status": "quarantined_hidden", "safe_to_forget": False}
         with (
+            mock.patch.object(broker, "_capture_binding", return_value=active_binding()),
             mock.patch.object(broker, "_stat", return_value=source),
             mock.patch.object(broker, "_load_open_files", return_value={}),
             mock.patch.object(
@@ -349,6 +523,7 @@ class DirtyRecoveryTests(unittest.TestCase):
             }
         }
         with (
+            mock.patch.object(broker, "_capture_binding", return_value=active_binding()),
             mock.patch.object(broker, "_stat", return_value=source),
             mock.patch.object(broker, "_load_open_files", return_value=previous),
             mock.patch.object(
@@ -380,7 +555,7 @@ class ActivationTests(unittest.TestCase):
             mock.patch.object(broker.os.path, "exists", return_value=True),
             mock.patch.object(broker, "_ensure_npp", return_value=(4242, 101)),
             mock.patch.object(broker.bridge, "_get_pid_notepadpp", return_value=[(101, 201)]),
-            mock.patch.object(broker.bridge, "get_current_file_path", return_value=target),
+            mock.patch.object(broker, "_capture_binding", return_value=active_binding(path=target)),
             mock.patch.object(broker, "_hide_npp"),
             mock.patch.object(broker.bridge, "_npp_doopen") as doopen,
         ):
@@ -396,14 +571,21 @@ class ActivationTests(unittest.TestCase):
             mock.patch.object(broker.os.path, "exists", return_value=True),
             mock.patch.object(broker, "_ensure_npp", return_value=(4242, 101)),
             mock.patch.object(broker.bridge, "_get_pid_notepadpp", return_value=[(101, 201)]),
-            mock.patch.object(broker.bridge, "get_current_file_path", side_effect=[other, target]),
+            mock.patch.object(
+                broker,
+                "_capture_binding",
+                side_effect=[
+                    active_binding(path=other, scin=201, view=broker.bridge.MAIN_VIEW),
+                    active_binding(path=target, scin=202, view=broker.bridge.SUB_VIEW),
+                ],
+            ),
             mock.patch.object(broker.bridge, "switch_to_file_by_path", return_value=True) as switch,
             mock.patch.object(broker, "_hide_npp"),
             mock.patch.object(broker.bridge, "_npp_doopen") as doopen,
         ):
             result = broker._activate(target, wait_timeout=0)
 
-        self.assertEqual(result, (101, 201, target))
+        self.assertEqual(result, (101, 202, target))
         switch.assert_called_once_with(101, target)
         doopen.assert_not_called()
 
@@ -477,7 +659,7 @@ class LaunchArgumentTests(unittest.TestCase):
                 broker._write_state(4242, r"C:\mcp\notepad++.exe", headless=True)
                 state = broker._read_state()
 
-        self.assertEqual(state["state_version"], 2)
+        self.assertEqual(state["state_version"], 3)
         self.assertTrue(state["headless"])
 
 
@@ -502,7 +684,13 @@ class LifecycleTests(unittest.TestCase):
 
     def set_headless_state(self) -> None:
         self.state_file.write_text(
-            json.dumps({"state_version": 2, "pid": 4242, "exe": "notepad++.exe", "headless": True}),
+            json.dumps({
+                "state_version": 3,
+                "pid": 4242,
+                "exe": "notepad++.exe",
+                "headless": True,
+                "startup_buffer_id": None,
+            }),
             encoding="utf-8",
         )
 
@@ -520,7 +708,11 @@ class LifecycleTests(unittest.TestCase):
         with (
             mock.patch.object(broker.bridge, "_is_pid_alive", return_value=True),
             mock.patch.object(broker.bridge, "_get_pid_notepadpp", return_value=[(101, 201)]),
-            mock.patch.object(broker.bridge, "get_current_file_path", return_value=r"C:\work\user.cpp"),
+            mock.patch.object(
+                broker,
+                "_capture_binding",
+                return_value=active_binding(path=r"C:\work\user.cpp"),
+            ),
             mock.patch.object(broker, "_dirty", return_value=True),
             mock.patch.object(broker, "_show_npp", return_value=True) as show_npp,
             mock.patch.object(broker, "_window_visible", return_value=True),
@@ -534,12 +726,33 @@ class LifecycleTests(unittest.TestCase):
         show_npp.assert_called_once_with(101)
         post_close.assert_not_called()
 
+    def test_release_uses_verified_active_scintilla_not_enumerated_guess(self) -> None:
+        binding = active_binding(path=r"C:\work\target.cpp", scin=201)
+        with (
+            mock.patch.object(broker.bridge, "_is_pid_alive", return_value=True),
+            mock.patch.object(broker.bridge, "_get_pid_notepadpp", return_value=[(101, 999)]),
+            mock.patch.object(broker, "_capture_binding", return_value=binding),
+            mock.patch.object(broker, "_dirty", side_effect=lambda scin: scin == 999) as dirty,
+            mock.patch.object(broker, "_title_dirty", return_value=False),
+            mock.patch.object(broker, "_show_npp", return_value=True),
+            mock.patch.object(broker, "_window_visible", return_value=True),
+        ):
+            result = broker._release_managed_npp(
+                "binding probe",
+                wait_timeout=0,
+                close_clean=False,
+                preserve_untracked=False,
+            )
+
+        self.assertEqual(result["dirty_paths"], [])
+        dirty.assert_called_once_with(201)
+
     def test_headless_dirty_window_is_quarantined_without_showing_gui(self) -> None:
         self.set_headless_state()
         with (
             mock.patch.object(broker.bridge, "_is_pid_alive", return_value=True),
             mock.patch.object(broker.bridge, "_get_pid_notepadpp", return_value=[(101, 201)]),
-            mock.patch.object(broker.bridge, "get_current_file_path", return_value=r"C:\work\target.cpp"),
+            mock.patch.object(broker, "_capture_binding", return_value=active_binding()),
             mock.patch.object(broker, "_dirty", return_value=True),
             mock.patch.object(broker, "_title_dirty", return_value=True),
             mock.patch.object(broker, "_hide_npp") as hide_npp,
@@ -565,7 +778,7 @@ class LifecycleTests(unittest.TestCase):
         with (
             mock.patch.object(broker.bridge, "_is_pid_alive", return_value=True),
             mock.patch.object(broker.bridge, "_get_pid_notepadpp", return_value=[(101, 201)]),
-            mock.patch.object(broker.bridge, "get_current_file_path", return_value=""),
+            mock.patch.object(broker, "_capture_binding", return_value=active_binding(path="")),
             mock.patch.object(broker, "_dirty", return_value=False),
             mock.patch.object(broker, "_title_dirty", return_value=False),
             mock.patch.object(broker, "_post_close", return_value=True) as post_close,
@@ -602,7 +815,11 @@ class LifecycleTests(unittest.TestCase):
         with (
             mock.patch.object(broker.bridge, "_is_pid_alive", return_value=True),
             mock.patch.object(broker.bridge, "_get_pid_notepadpp", return_value=[(101, 201)]),
-            mock.patch.object(broker.bridge, "get_current_file_path", return_value=r"C:\work\MRMesh.h"),
+            mock.patch.object(
+                broker,
+                "_capture_binding",
+                return_value=active_binding(path=r"C:\work\MRMesh.h"),
+            ),
             mock.patch.object(broker, "_dirty", return_value=False),
             mock.patch.object(broker, "_title_dirty", return_value=False),
             mock.patch.object(broker, "_hide_npp"),
@@ -625,7 +842,7 @@ class LifecycleTests(unittest.TestCase):
         with (
             mock.patch.object(broker.bridge, "_is_pid_alive", return_value=True),
             mock.patch.object(broker.bridge, "_find_pid_top", return_value=(101, 201)),
-            mock.patch.object(broker.bridge, "get_current_file_path", return_value=r"C:\work\target.cpp"),
+            mock.patch.object(broker, "_capture_binding", return_value=active_binding()),
             mock.patch.object(broker, "_load_open_files", return_value={}),
             mock.patch.object(broker, "_hide_npp") as hide_npp,
             mock.patch.object(broker, "_release_managed_npp") as release,
@@ -640,7 +857,7 @@ class LifecycleTests(unittest.TestCase):
         with (
             mock.patch.object(broker.bridge, "_is_pid_alive", return_value=True),
             mock.patch.object(broker.bridge, "_get_pid_notepadpp", return_value=[(101, 201)]),
-            mock.patch.object(broker.bridge, "get_current_file_path", return_value=""),
+            mock.patch.object(broker, "_capture_binding", return_value=active_binding(path="")),
             mock.patch.object(broker, "_dirty", return_value=False),
             mock.patch.object(broker, "_post_close", return_value=True) as post_close,
             mock.patch.object(broker, "_show_npp", return_value=True) as show_npp,
@@ -664,7 +881,7 @@ class LifecycleTests(unittest.TestCase):
         with (
             mock.patch.object(broker.bridge, "_is_pid_alive", side_effect=[True, False, False]),
             mock.patch.object(broker.bridge, "_get_pid_notepadpp", return_value=[(101, 201)]),
-            mock.patch.object(broker.bridge, "get_current_file_path", return_value=""),
+            mock.patch.object(broker, "_capture_binding", return_value=active_binding(path="")),
             mock.patch.object(broker, "_dirty", return_value=False),
             mock.patch.object(broker, "_post_close", return_value=True),
         ):
@@ -697,6 +914,247 @@ class LifecycleTests(unittest.TestCase):
 
         self.assertTrue(result["tab_closed"])
         self.assertEqual(result["lifecycle"], lifecycle)
+
+    def test_shutdown_returns_the_verified_binding_fields(self) -> None:
+        binding = active_binding()
+        lifecycle = {
+            "status": "closed",
+            "safe_to_forget": True,
+            "window_states": [{**binding, "modified": False, "title_dirty": False}],
+        }
+        with mock.patch.object(broker, "_release_managed_npp", return_value=lifecycle):
+            result = broker.dgs_shutdown({})
+
+        for name in broker.BINDING_FIELDS:
+            self.assertEqual(result[name], binding[name])
+        self.assertTrue(result["safe_to_stop"])
+
+
+class StartupPlaceholderTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.state = {
+            "state_version": 3,
+            "pid": 4242,
+            "exe": "notepad++.exe",
+            "headless": True,
+            "startup_buffer_id": 777,
+            "startup_path": "new 1",
+        }
+        self.binding = active_binding(
+            path="new 1",
+            scin=202,
+            buffer_id=777,
+            view=broker.bridge.SUB_VIEW,
+        )
+
+    def test_empty_dirty_recorded_startup_buffer_is_cleaned_and_closed(self) -> None:
+        with (
+            mock.patch.object(broker, "_capture_binding", return_value=self.binding),
+            mock.patch.object(broker.bridge, "activate_buffer_id", return_value=self.binding),
+            mock.patch.object(broker.bridge, "get_document_length", return_value=0),
+            mock.patch.object(broker, "_dirty", side_effect=[True, False]),
+            mock.patch.object(broker.bridge, "set_document_save_point", return_value=True) as savepoint,
+            mock.patch.object(broker, "_close_current_tab_if_clean", return_value=True) as close,
+        ):
+            result = broker._cleanup_startup_placeholder(self.state, 101)
+
+        self.assertEqual(result["status"], "closed_empty_startup_buffer")
+        self.assertTrue(result["changed"])
+        self.assertTrue(result["savepoint_cleared"])
+        savepoint.assert_called_once_with(202)
+        close.assert_called_once_with(
+            101,
+            202,
+            expected_path="new 1",
+            expected_buffer_id=777,
+        )
+
+    def test_nonempty_startup_buffer_remains_protected(self) -> None:
+        with (
+            mock.patch.object(broker, "_capture_binding", return_value=self.binding),
+            mock.patch.object(broker.bridge, "activate_buffer_id", return_value=self.binding),
+            mock.patch.object(broker.bridge, "get_document_length", return_value=1),
+            mock.patch.object(broker, "_dirty", return_value=True),
+            mock.patch.object(broker.bridge, "set_document_save_point") as savepoint,
+            mock.patch.object(broker, "_close_current_tab_if_clean") as close,
+        ):
+            result = broker._cleanup_startup_placeholder(self.state, 101)
+
+        self.assertEqual(result["status"], "protected_nonempty")
+        self.assertFalse(result["changed"])
+        savepoint.assert_not_called()
+        close.assert_not_called()
+
+    def test_startup_buffer_id_mismatch_never_clears_dirty_state(self) -> None:
+        with (
+            mock.patch.object(
+                broker,
+                "_capture_binding",
+                side_effect=[self.binding, RuntimeError("active Notepad++ BufferID changed")],
+            ),
+            mock.patch.object(
+                broker.bridge,
+                "activate_buffer_id",
+                return_value=active_binding(path="new 1", scin=202, buffer_id=888),
+            ),
+            mock.patch.object(broker.bridge, "set_document_save_point") as savepoint,
+            mock.patch.object(broker, "_close_current_tab_if_clean") as close,
+        ):
+            result = broker._cleanup_startup_placeholder(self.state, 101)
+
+        self.assertEqual(result["status"], "inspection_failed")
+        savepoint.assert_not_called()
+        close.assert_not_called()
+
+
+@unittest.skipUnless(
+    os.environ.get("DGS_NPP_LIVE_TESTS") == "1",
+    "set DGS_NPP_LIVE_TESTS=1 to exercise the bundled Notepad++ runtime",
+)
+class LiveBindingIntegrationTests(unittest.TestCase):
+    def test_same_path_two_pids_100_reads_and_managed_only_shutdown(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            path = root / "same-path.cpp"
+            data = b"line one\r\nline two\r\n" * 16
+            path.write_bytes(data)
+            state_dir = root / "state"
+            state_file = state_dir / "npp-instance-broker.json"
+            open_files_file = state_dir / "open-files.json"
+            user_settings = root / "user-settings"
+            managed_settings = root / "managed-settings"
+            user_settings.mkdir()
+            managed_settings.mkdir()
+            original_build_npp_args = broker.bridge.build_npp_args
+            user_proc = None
+            user_top = None
+            managed_pid = None
+
+            with (
+                mock.patch.object(broker, "STATE_DIR", state_dir),
+                mock.patch.object(broker, "STATE_FILE", state_file),
+                mock.patch.object(broker, "OPEN_FILES_FILE", open_files_file),
+                mock.patch.object(
+                    broker.bridge,
+                    "build_npp_args",
+                    side_effect=lambda exe: original_build_npp_args(exe)
+                    + [f"-settingsDir={managed_settings}"],
+                ),
+            ):
+                try:
+                    startup = subprocess.STARTUPINFO()
+                    startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    startup.wShowWindow = broker.SW_HIDE
+                    user_proc = subprocess.Popen(
+                        [
+                            broker.bridge.BUNDLED_NPP_EXE,
+                            "-multiInst",
+                            "-nosession",
+                            f"-settingsDir={user_settings}",
+                            str(path),
+                        ],
+                        cwd=broker.bridge.npp_working_directory(broker.bridge.BUNDLED_NPP_EXE),
+                        startupinfo=startup,
+                    )
+                    for _ in range(100):
+                        user_top, _ = broker.bridge._find_pid_top(user_proc.pid)
+                        if user_top:
+                            break
+                        time.sleep(0.05)
+                    self.assertTrue(user_top)
+                    broker.bridge.u32.ShowWindow(user_top, broker.SW_HIDE)
+
+                    top, main_scin, path_abs = broker._activate(str(path), 15)
+                    broker.bridge.u32.SendMessageW(top, 0x0111, 10002, 0)
+                    time.sleep(0.15)
+                    top, scin, path_abs = broker._activate(str(path), 15)
+                    meta = broker._prepare_document(
+                        path_abs,
+                        top,
+                        scin,
+                        True,
+                        read_only=True,
+                        operation="live_100_read_probe",
+                    )
+                    managed_pid = int(meta["binding"]["pid"])
+                    buffer_id = int(meta["binding"]["buffer_id"])
+                    self.assertNotEqual(main_scin, scin)
+                    self.assertEqual(meta["binding"]["active_view"], broker.bridge.SUB_VIEW)
+                    hashes = []
+                    for _ in range(100):
+                        snapshot = broker._read_buffer_snapshot(
+                            scin,
+                            top=top,
+                            expected_path=path_abs,
+                            expected_buffer_id=buffer_id,
+                        )
+                        self.assertEqual(snapshot["data"], data)
+                        self.assertEqual(snapshot["binding"]["pid"], managed_pid)
+                        hashes.append(snapshot["sha256"])
+                        meta["binding"] = snapshot["binding"]
+
+                    self.assertFalse(
+                        broker._close_current_tab_if_clean(
+                            top,
+                            scin,
+                            expected_path=path_abs,
+                            expected_buffer_id=buffer_id,
+                            close_timeout=0.25,
+                        )
+                    )
+                    remaining = broker._capture_binding(
+                        top,
+                        expected_path=path_abs,
+                        expected_buffer_id=buffer_id,
+                    )
+                    self.assertEqual(remaining["active_view"], broker.bridge.MAIN_VIEW)
+                    self.assertTrue(
+                        broker._close_current_tab_if_clean(
+                            top,
+                            int(remaining["scintilla_hwnd"]),
+                            expected_path=path_abs,
+                            expected_buffer_id=buffer_id,
+                        )
+                    )
+                    self.assertIsNone(broker.bridge.get_buffer_position(top, buffer_id))
+
+                    top, scin, path_abs = broker._activate(str(path), 15)
+                    reopened = broker._capture_binding(
+                        top,
+                        expected_path=path_abs,
+                        expected_scin=scin,
+                    )
+                    meta["binding"] = reopened
+                    broker._record(path_abs, top, scin, {
+                        **meta,
+                        "dirty": False,
+                        "buffer_modified": False,
+                        "title_dirty": False,
+                    })
+                    shutdown = broker.dgs_shutdown({"wait_timeout": 5})
+                    self.assertEqual(len(set(hashes)), 1)
+                    self.assertNotEqual(user_proc.pid, managed_pid)
+                    self.assertTrue(shutdown["safe_to_stop"])
+                    self.assertTrue(broker.bridge._is_pid_alive(user_proc.pid))
+                    self.assertFalse(broker.bridge._is_pid_alive(managed_pid))
+                finally:
+                    state = broker._read_state() or {}
+                    cleanup_pid = managed_pid or int(state.get("pid") or 0)
+                    if (
+                        cleanup_pid
+                        and (not user_proc or cleanup_pid != user_proc.pid)
+                        and broker.bridge._is_pid_alive(cleanup_pid)
+                    ):
+                        broker.dgs_shutdown({"wait_timeout": 2})
+                        if broker.bridge._is_pid_alive(cleanup_pid):
+                            broker._terminate_pid(cleanup_pid)
+                    if user_top:
+                        broker.bridge.u32.PostMessageW(user_top, broker.WM_CLOSE, 0, 0)
+                    if user_proc:
+                        try:
+                            user_proc.wait(5)
+                        except subprocess.TimeoutExpired:
+                            user_proc.kill()
 
 
 class TransportTests(unittest.TestCase):
