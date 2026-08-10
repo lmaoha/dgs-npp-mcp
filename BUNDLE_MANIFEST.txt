@@ -1,11 +1,11 @@
 DGS Notepad++ MCP self-contained bundle
-MCP version: 0.8.3
+MCP version: 0.8.4
 Bundled runtime: runtime\notepad-plus-plus-headless\notepad++.exe
 Notepad++ version: 8.5.7 x64
-Executable SHA256: 4675EADE20530B7BFD1EDF9DF12CA165AB419DFA165B14A46539C6114E373573
-Corresponding source: https://github.com/lmaoha/notepad-plus-plus/tree/dgs-headless-8.5.7-1
-Modified source commit: 5e786a67bcb62ba4aee1a25ab5b554fbf630d8c7
-Source submodule: third_party\notepad-plus-plus @ 5e786a67bcb62ba4aee1a25ab5b554fbf630d8c7
+Executable SHA256: FD4DFD2A2F9677796498F4693C60EEC4101243C070EDAF24A1FDF891568FD2E0
+Corresponding source: https://github.com/lmaoha/notepad-plus-plus/tree/dgs-headless-8.5.7-2
+Modified source commit: 92bfba7d06fc7ece814d639e65291be9352afb15
+Source submodule: third_party\notepad-plus-plus @ 92bfba7d06fc7ece814d639e65291be9352afb15
 Official base commit: 5008b8a0cccfff255c5f48b5782ef993b6f9b631
 OriginalFilename: notepad++.exe
 InternalName: notepad++.exe

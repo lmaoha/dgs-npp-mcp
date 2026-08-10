@@ -655,12 +655,75 @@ class LaunchArgumentTests(unittest.TestCase):
             with (
                 mock.patch.object(broker, "STATE_DIR", Path(temp_dir)),
                 mock.patch.object(broker, "STATE_FILE", state_file),
+                mock.patch.object(broker.bridge, "get_file_version", return_value="8.5.7"),
             ):
                 broker._write_state(4242, r"C:\mcp\notepad++.exe", headless=True)
                 state = broker._read_state()
 
-        self.assertEqual(state["state_version"], 3)
+        self.assertEqual(state["state_version"], 4)
         self.assertTrue(state["headless"])
+        self.assertEqual(state["launch_mode"], "headless")
+        self.assertEqual(state["window_class"], broker.bridge.DGS_NPP_WINDOW_CLASS)
+        self.assertEqual(state["runtime_version"], "8.5.7")
+
+
+class WindowOwnershipTests(unittest.TestCase):
+    def test_pid_enumeration_selects_only_the_expected_launch_mode(self) -> None:
+        expected_exe = r"C:\mcp\notepad++.exe"
+        with (
+            mock.patch.object(broker.bridge, "process_exe_path", return_value=broker.bridge._normal_exe_path(expected_exe)),
+            mock.patch.object(broker.bridge, "_enum_toplevel", return_value=[101, 102]),
+            mock.patch.object(
+                broker.bridge,
+                "_get_class",
+                side_effect=lambda hwnd: (
+                    broker.bridge.DGS_NPP_WINDOW_CLASS
+                    if hwnd == 101
+                    else broker.bridge.NPP_WINDOW_CLASS
+                ),
+            ),
+            mock.patch.object(broker.bridge, "window_process_id", return_value=4242),
+            mock.patch.object(broker.bridge, "_pick_scintilla", side_effect=lambda hwnd: hwnd + 100),
+        ):
+            result = broker.bridge._get_pid_notepadpp(
+                4242,
+                expected_exe=expected_exe,
+                expected_headless=True,
+            )
+
+        self.assertEqual(result, [(101, 201)])
+
+    def test_pid_enumeration_rejects_an_executable_path_mismatch(self) -> None:
+        with (
+            mock.patch.object(broker.bridge, "process_exe_path", return_value=r"c:\other\notepad++.exe"),
+            mock.patch.object(broker.bridge, "_enum_toplevel") as enum_windows,
+        ):
+            result = broker.bridge._get_pid_notepadpp(
+                4242,
+                expected_exe=r"C:\mcp\notepad++.exe",
+                expected_headless=True,
+            )
+
+        self.assertEqual(result, [])
+        enum_windows.assert_not_called()
+
+    def test_window_identity_rejects_normal_class_for_headless_ownership(self) -> None:
+        expected_exe = broker.bridge._normal_exe_path(r"C:\mcp\notepad++.exe")
+        identity = {
+            "pid": 4242,
+            "top_hwnd": 101,
+            "window_class": broker.bridge.NPP_WINDOW_CLASS,
+            "headless": False,
+            "exe": expected_exe,
+        }
+        with mock.patch.object(broker.bridge, "get_window_identity", return_value=identity):
+            with self.assertRaisesRegex(RuntimeError, "launch-mode mismatch"):
+                broker.bridge.validate_window_identity(
+                    101,
+                    expected_pid=4242,
+                    expected_exe=expected_exe,
+                    expected_headless=True,
+                )
 
 
 class LifecycleTests(unittest.TestCase):
@@ -842,6 +905,18 @@ class LifecycleTests(unittest.TestCase):
         with (
             mock.patch.object(broker.bridge, "_is_pid_alive", return_value=True),
             mock.patch.object(broker.bridge, "_find_pid_top", return_value=(101, 201)),
+            mock.patch.object(
+                broker.bridge,
+                "validate_window_identity",
+                return_value={
+                    "pid": 4242,
+                    "top_hwnd": 101,
+                    "window_class": broker.bridge.DGS_NPP_WINDOW_CLASS,
+                    "headless": True,
+                    "exe": broker.bridge._normal_exe_path("notepad++.exe"),
+                },
+            ),
+            mock.patch.object(broker.bridge, "get_file_version", return_value="8.5.7"),
             mock.patch.object(broker, "_capture_binding", return_value=active_binding()),
             mock.patch.object(broker, "_load_open_files", return_value={}),
             mock.patch.object(broker, "_hide_npp") as hide_npp,
@@ -1025,6 +1100,7 @@ class LiveBindingIntegrationTests(unittest.TestCase):
             managed_settings = root / "managed-settings"
             user_settings.mkdir()
             managed_settings.mkdir()
+            test_exe = broker.bridge.find_npp_exe()
             original_build_npp_args = broker.bridge.build_npp_args
             user_proc = None
             user_top = None
@@ -1042,29 +1118,52 @@ class LiveBindingIntegrationTests(unittest.TestCase):
                 ),
             ):
                 try:
-                    startup = subprocess.STARTUPINFO()
-                    startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                    startup.wShowWindow = broker.SW_HIDE
+                    top, main_scin, path_abs = broker._activate(str(path), 15)
+                    managed_state = broker._read_state() or {}
+                    managed_pid = int(managed_state.get("pid") or 0)
+                    self.assertTrue(managed_pid)
+                    self.assertEqual(
+                        broker.bridge._get_class(top),
+                        broker.bridge.DGS_NPP_WINDOW_CLASS,
+                    )
+                    self.assertFalse(broker.bridge.u32.IsWindowVisible(top))
+
+                    # This intentionally omits -multiInst. It models a normal
+                    # user launch after the DGS headless process is already up.
                     user_proc = subprocess.Popen(
                         [
-                            broker.bridge.BUNDLED_NPP_EXE,
-                            "-multiInst",
+                            test_exe,
                             "-nosession",
                             f"-settingsDir={user_settings}",
                             str(path),
                         ],
-                        cwd=broker.bridge.npp_working_directory(broker.bridge.BUNDLED_NPP_EXE),
-                        startupinfo=startup,
+                        cwd=broker.bridge.npp_working_directory(test_exe),
                     )
-                    for _ in range(100):
-                        user_top, _ = broker.bridge._find_pid_top(user_proc.pid)
+                    user_binding = None
+                    for _ in range(300):
+                        user_top, _ = broker.bridge._find_pid_top(
+                            user_proc.pid,
+                            expected_exe=test_exe,
+                            expected_headless=False,
+                        )
                         if user_top:
-                            break
+                            try:
+                                candidate = broker.bridge.get_active_document_snapshot(user_top)
+                                if broker._norm(candidate["path"]) == broker._norm(str(path)):
+                                    user_binding = candidate
+                                    break
+                            except Exception:
+                                pass
                         time.sleep(0.05)
-                    self.assertTrue(user_top)
+                    self.assertIsNotNone(user_binding)
+                    self.assertNotEqual(user_proc.pid, managed_pid)
+                    self.assertEqual(
+                        broker.bridge._get_class(user_top),
+                        broker.bridge.NPP_WINDOW_CLASS,
+                    )
+                    self.assertTrue(broker.bridge.u32.IsWindowVisible(user_top))
                     broker.bridge.u32.ShowWindow(user_top, broker.SW_HIDE)
 
-                    top, main_scin, path_abs = broker._activate(str(path), 15)
                     broker.bridge.u32.SendMessageW(top, 0x0111, 10002, 0)
                     time.sleep(0.15)
                     top, scin, path_abs = broker._activate(str(path), 15)
@@ -1076,7 +1175,7 @@ class LiveBindingIntegrationTests(unittest.TestCase):
                         read_only=True,
                         operation="live_100_read_probe",
                     )
-                    managed_pid = int(meta["binding"]["pid"])
+                    self.assertEqual(int(meta["binding"]["pid"]), managed_pid)
                     buffer_id = int(meta["binding"]["buffer_id"])
                     self.assertNotEqual(main_scin, scin)
                     self.assertEqual(meta["binding"]["active_view"], broker.bridge.SUB_VIEW)

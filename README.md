@@ -32,7 +32,7 @@ Scintilla 编辑缓冲区检索和修改文档。
 仓库包含完整的 Notepad++ 8.5.7 x64 headless 便携运行时，无需另外安装
 Notepad++。桥接源码使用 MIT 许可证；修改版 Notepad++ 继续使用 GPLv3，其完整
 对应源码固定在
-[`dgs-headless-8.5.7-1`](https://github.com/lmaoha/notepad-plus-plus/tree/dgs-headless-8.5.7-1)
+[`dgs-headless-8.5.7-2`](https://github.com/lmaoha/notepad-plus-plus/tree/dgs-headless-8.5.7-2)
 tag，并通过 `third_party/notepad-plus-plus` submodule 引用同一提交。企业插件和
 解密组件不在本项目中分发。
 
@@ -87,7 +87,7 @@ args = ['C:\path\to\dgs-npp-mcp\server.py']
 修改操作使用 `mtime` 和内容 SHA-256 做乐观并发检查。如果文件在搜索与保存之间
 发生变化，patch 会被拒绝。通信失败、超时或未确认保存时，桥不会盲目重试覆盖。
 
-从 0.8.3 起，每次缓冲区操作都验证同一份 `PID + path + Buffer ID + active view +
+从 0.8.4 起，每次缓冲区操作都验证同一份 `PID + path + Buffer ID + active view +
 Scintilla HWND` 快照。活动编辑区通过 Notepad++ 官方消息取得，不再根据窗口可见性
 或文本长度猜测。用户自己的 Notepad++ 与 headless 托管实例可以同时打开同一路径，
 两者仍按 PID 隔离。
@@ -152,7 +152,7 @@ The repository includes a complete portable Notepad++ 8.5.7 x64 headless
 runtime, so a separate Notepad++ installation is not required. The bridge
 source is MIT-licensed. The modified Notepad++ runtime remains GPLv3, with its
 complete corresponding source pinned at
-[`dgs-headless-8.5.7-1`](https://github.com/lmaoha/notepad-plus-plus/tree/dgs-headless-8.5.7-1).
+[`dgs-headless-8.5.7-2`](https://github.com/lmaoha/notepad-plus-plus/tree/dgs-headless-8.5.7-2).
 The same commit is referenced by the `third_party/notepad-plus-plus` submodule.
 Enterprise plugins and decryption components are not distributed here.
 
@@ -214,11 +214,12 @@ concurrency tokens. A patch is refused if the source changes between search
 and save. Communication failures, timeouts, and unconfirmed saves are not
 blindly retried over the source.
 
-Since 0.8.3, every buffer operation verifies one stable
+Since 0.8.4, every buffer operation verifies one stable
 `PID + path + BufferID + active view + Scintilla HWND` snapshot. The active
 editor is selected through Notepad++'s official message rather than inferred
 from visibility or text length. A user's interactive Notepad++ and the managed
-headless process remain isolated by PID even when both open the same path.
+headless process remain isolated by PID, executable path, mutex, and window
+class even when both open the same path.
 
 The broker records the empty startup BufferID. Shutdown may automatically close
 that placeholder only while the BufferID still matches, its path is not

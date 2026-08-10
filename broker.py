@@ -31,7 +31,7 @@ except Exception:
 
 
 SERVER_NAME = "dgs_npp_broker"
-SERVER_VERSION = "0.8.3"
+SERVER_VERSION = "0.8.4"
 BROKER_DIR = Path(__file__).resolve().parent
 STATE_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "dgs-npp-mcp"
 STATE_FILE = STATE_DIR / "npp-instance-broker.json"
@@ -48,7 +48,7 @@ SW_SHOW = 5
 SW_RESTORE = 9
 WM_CLOSE = 0x0010
 MAX_SAFE_JSON_INTEGER = (1 << 53) - 1
-OWNERSHIP_STATE_VERSION = 3
+OWNERSHIP_STATE_VERSION = 4
 
 
 def _load_bridge() -> Any:
@@ -355,8 +355,11 @@ def _write_state(
     state: dict[str, Any] = {
         "state_version": OWNERSHIP_STATE_VERSION,
         "pid": int(pid),
-        "exe": exe,
+        "exe": bridge._normal_exe_path(exe),
         "headless": bool(headless),
+        "launch_mode": "headless" if headless else "normal",
+        "window_class": bridge.expected_window_class(headless),
+        "runtime_version": bridge.get_file_version(exe),
         "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     if startup_buffer_id is not None:
@@ -375,6 +378,57 @@ def _state_is_headless(state: dict[str, Any]) -> bool:
         return bool(bridge._is_bundled_exe(exe))
     except Exception:
         return False
+
+
+def _state_identity_filters(state: dict[str, Any] | None) -> dict[str, Any]:
+    if not state:
+        return {}
+    return {
+        "expected_exe": state.get("exe"),
+        "expected_headless": _state_is_headless(state),
+    }
+
+
+def _managed_pairs(pid: int, *, include_hidden: bool = True) -> list[tuple[int, int]]:
+    state = _read_state()
+    filters = (
+        _state_identity_filters(state)
+        if state and int(state.get("pid") or 0) == int(pid)
+        else {}
+    )
+    return bridge._get_pid_notepadpp(
+        int(pid),
+        include_hidden=include_hidden,
+        **filters,
+    )
+
+
+def _find_managed_top(pid: int) -> tuple[int | None, int | None]:
+    state = _read_state()
+    filters = (
+        _state_identity_filters(state)
+        if state and int(state.get("pid") or 0) == int(pid)
+        else {}
+    )
+    return bridge._find_pid_top(int(pid), **filters)
+
+
+def _validate_managed_window(state: dict[str, Any], top: int) -> dict[str, Any]:
+    identity = bridge.validate_window_identity(
+        top,
+        expected_pid=int(state.get("pid") or 0),
+        expected_exe=state.get("exe"),
+        expected_headless=_state_is_headless(state),
+    )
+    updated = dict(state)
+    updated["state_version"] = OWNERSHIP_STATE_VERSION
+    updated["exe"] = identity["exe"]
+    updated["headless"] = bool(identity["headless"])
+    updated["launch_mode"] = "headless" if identity["headless"] else "normal"
+    updated["window_class"] = identity["window_class"]
+    updated["runtime_version"] = bridge.get_file_version(identity["exe"])
+    _save_state_payload(updated)
+    return identity
 
 
 def _record_startup_placeholder_if_safe(top: int) -> dict[str, Any] | None:
@@ -410,7 +464,7 @@ def _clear_state() -> None:
     if state:
         pid = int(state.get("pid") or 0)
         if bridge._is_pid_alive(pid):
-            pairs = bridge._get_pid_notepadpp(pid, include_hidden=True)
+            pairs = _managed_pairs(pid, include_hidden=True)
             if not pairs or any(not _window_visible(top) for top, _ in pairs):
                 raise RuntimeError(
                     f"refusing to clear ownership of live hidden Notepad++ pid={pid}"
@@ -438,12 +492,14 @@ def _save_open_files(files: dict[str, dict[str, Any]]) -> None:
 def _ensure_npp(wait_timeout: float = 15.0) -> tuple[int, int]:
     state = _read_state()
     if state and bridge._is_pid_alive(state.get("pid")):
-        top, _ = bridge._find_pid_top(state["pid"])
+        top, _ = _find_managed_top(int(state["pid"]))
         if not top:
             raise RuntimeError(
-                f"managed Notepad++ pid={state.get('pid')} is alive without a targetable window; "
+                f"managed Notepad++ pid={state.get('pid')} is alive without a window matching "
+                "its owned EXE, class, and launch mode; "
                 "refusing to overwrite its ownership state"
             )
+        _validate_managed_window(state, top)
         try:
             _record_startup_placeholder_if_safe(top)
         except Exception as exc:
@@ -475,7 +531,7 @@ def _ensure_npp(wait_timeout: float = 15.0) -> tuple[int, int]:
     startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     startupinfo.wShowWindow = SW_HIDE
     npp_args = bridge.build_npp_args(exe)
-    headless = any(str(arg).lower() == "-headless" for arg in npp_args[1:])
+    headless = any(str(arg).lower() in {"-headless", "--headless"} for arg in npp_args[1:])
     cwd = bridge.npp_working_directory(exe)
     _log(f"starting managed Notepad++: exe={exe!r} cwd={cwd!r} args={' '.join(npp_args[1:])}")
     proc = subprocess.Popen(npp_args, shell=False, startupinfo=startupinfo, cwd=cwd)
@@ -483,8 +539,10 @@ def _ensure_npp(wait_timeout: float = 15.0) -> tuple[int, int]:
     deadline = time.time() + wait_timeout
     while time.time() < deadline:
         time.sleep(0.15)
-        top, _ = bridge._find_pid_top(proc.pid)
+        top, _ = _find_managed_top(proc.pid)
         if top:
+            state = _read_state() or {}
+            _validate_managed_window(state, top)
             _hide_npp(top)
             try:
                 _record_startup_placeholder_if_safe(top)
@@ -649,7 +707,7 @@ def _release_managed_npp(
             "safe_to_forget": True,
         }
 
-    pairs = bridge._get_pid_notepadpp(pid, include_hidden=True)
+    pairs = _managed_pairs(pid, include_hidden=True)
     if not pairs:
         return {
             "status": "live_process_without_window",
@@ -667,7 +725,7 @@ def _release_managed_npp(
             except Exception as exc:
                 _log(f"could not migrate startup buffer state for pid={pid}: {type(exc).__name__}: {exc}")
             placeholder_actions.append(_cleanup_startup_placeholder(state, top))
-        pairs = bridge._get_pid_notepadpp(pid, include_hidden=True)
+        pairs = _managed_pairs(pid, include_hidden=True)
 
     tracked = _load_open_files()
     dirty_paths: list[str] = []
@@ -749,7 +807,7 @@ def _release_managed_npp(
             }
         must_retain = True
 
-    live_pairs = bridge._get_pid_notepadpp(pid, include_hidden=True)
+    live_pairs = _managed_pairs(pid, include_hidden=True)
     if headless:
         for top, _ in live_pairs:
             _hide_npp(top)
@@ -829,7 +887,7 @@ def _activate(path: str, wait_timeout: float = 15.0) -> tuple[int, int, str]:
     def active_target() -> tuple[int, int] | None:
         nonlocal last_path
         seen: set[int] = set()
-        for top_hwnd, _ in bridge._get_pid_notepadpp(pid, include_hidden=True):
+        for top_hwnd, _ in _managed_pairs(pid, include_hidden=True):
             if int(top_hwnd) in seen:
                 continue
             seen.add(int(top_hwnd))
@@ -850,7 +908,7 @@ def _activate(path: str, wait_timeout: float = 15.0) -> tuple[int, int, str]:
 
     # Switch to an existing tab before opening. NPPM_DOOPEN on an already-open
     # dirty path can create a second clean tab and leave the dirty tab behind.
-    for top_hwnd, _ in bridge._get_pid_notepadpp(pid, include_hidden=True):
+    for top_hwnd, _ in _managed_pairs(pid, include_hidden=True):
         if bridge.switch_to_file_by_path(top_hwnd, path_abs):
             time.sleep(0.1)
             active = active_target()
@@ -861,7 +919,7 @@ def _activate(path: str, wait_timeout: float = 15.0) -> tuple[int, int, str]:
     deadline = time.time() + wait_timeout
     while time.time() < deadline:
         time.sleep(0.1)
-        for top_hwnd, _ in bridge._get_pid_notepadpp(pid, include_hidden=True):
+        for top_hwnd, _ in _managed_pairs(pid, include_hidden=True):
             bridge.switch_to_file_by_path(top_hwnd, path_abs)
         active = active_target()
         if active:
@@ -2042,13 +2100,16 @@ def dgs_list_open_files(args: dict[str, Any]) -> dict[str, Any]:
                 "pid": pid,
                 "exe": state.get("exe"),
                 "headless": _state_is_headless(state),
+                "launch_mode": state.get("launch_mode"),
+                "window_class": state.get("window_class"),
+                "runtime_version": state.get("runtime_version"),
                 "alive": alive,
                 "started_at": state.get("started_at"),
                 "startup_buffer_id": state.get("startup_buffer_id"),
             }
             if alive:
                 try:
-                    top, _ = bridge._find_pid_top(pid)
+                    top, _ = _find_managed_top(pid)
                     if top:
                         binding = _capture_binding(top)
                         ownership["binding"] = _binding_result(binding)

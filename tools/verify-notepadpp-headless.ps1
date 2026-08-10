@@ -29,6 +29,7 @@ namespace NppHeadlessProbe
     public sealed class Snapshot
     {
         public IntPtr TopWindow { get; set; }
+        public string WindowClass { get; set; }
         public bool Visible { get; set; }
         public int ScintillaCount { get; set; }
         public ulong MaxTextLength { get; set; }
@@ -77,14 +78,14 @@ namespace NppHeadlessProbe
             return value.ToString();
         }
 
-        public static Snapshot Capture(int processId)
+        public static Snapshot Capture(int processId, string expectedWindowClass)
         {
             IntPtr top = IntPtr.Zero;
             EnumWindows(delegate(IntPtr hwnd, IntPtr unused)
             {
                 uint owner;
                 GetWindowThreadProcessId(hwnd, out owner);
-                if (owner == (uint)processId && WindowClass(hwnd) == "Notepad++")
+                if (owner == (uint)processId && WindowClass(hwnd) == expectedWindowClass)
                 {
                     top = hwnd;
                     return false;
@@ -123,23 +124,24 @@ namespace NppHeadlessProbe
             return new Snapshot
             {
                 TopWindow = top,
+                WindowClass = WindowClass(top),
                 Visible = IsWindowVisible(top),
                 ScintillaCount = scintillaCount,
                 MaxTextLength = maxTextLength
             };
         }
 
-        public static Snapshot WaitForSnapshot(int processId, int timeoutMilliseconds)
+        public static Snapshot WaitForSnapshot(int processId, string expectedWindowClass, int timeoutMilliseconds)
         {
             Stopwatch timer = Stopwatch.StartNew();
             while (timer.ElapsedMilliseconds < timeoutMilliseconds)
             {
-                Snapshot snapshot = Capture(processId);
+                Snapshot snapshot = Capture(processId, expectedWindowClass);
                 if (snapshot != null && snapshot.ScintillaCount > 0 && snapshot.MaxTextLength > 0)
                     return snapshot;
                 Thread.Sleep(100);
             }
-            return Capture(processId);
+            return Capture(processId, expectedWindowClass);
         }
 
         public static bool RequestClose(IntPtr topWindow)
@@ -174,12 +176,17 @@ function Invoke-NppModeProbe {
 
     $process = [System.Diagnostics.Process]::Start($startInfo)
     try {
+        $expectedWindowClass = if ($Name -eq "Headless") { "DGS.Notepad++" } else { "Notepad++" }
         $snapshot = [NppHeadlessProbe.Native]::WaitForSnapshot(
             $process.Id,
+            $expectedWindowClass,
             $StartupTimeoutSeconds * 1000
         )
         if ($null -eq $snapshot) {
-            throw "$Name mode did not create a Notepad++ top-level window"
+            throw "$Name mode did not create a $expectedWindowClass top-level window"
+        }
+        if ($snapshot.WindowClass -ne $expectedWindowClass) {
+            throw "$Name mode class was $($snapshot.WindowClass), expected $expectedWindowClass"
         }
         if ($snapshot.Visible -ne $ExpectedVisible) {
             throw "$Name mode visibility was $($snapshot.Visible), expected $ExpectedVisible"
@@ -205,6 +212,7 @@ function Invoke-NppModeProbe {
             Mode = $Name
             Pid = $process.Id
             TopHwnd = $snapshot.TopWindow.ToInt64()
+            WindowClass = $snapshot.WindowClass
             Visible = $snapshot.Visible
             ScintillaCount = $snapshot.ScintillaCount
             MaxTextLength = $snapshot.MaxTextLength
