@@ -1,0 +1,4 @@
+[submodule "third_party/notepad-plus-plus"]
+	path = third_party/notepad-plus-plus
+	url = https://github.com/lmaoha/notepad-plus-plus.git
+	branch = dgs-headless-8.5.7

@@ -33,7 +33,8 @@ Scintilla 编辑缓冲区检索和修改文档。
 Notepad++。桥接源码使用 MIT 许可证；修改版 Notepad++ 继续使用 GPLv3，其完整
 对应源码固定在
 [`dgs-headless-8.5.7-1`](https://github.com/lmaoha/notepad-plus-plus/tree/dgs-headless-8.5.7-1)
-tag。企业插件和解密组件不在本项目中分发。
+tag，并通过 `third_party/notepad-plus-plus` submodule 引用同一提交。企业插件和
+解密组件不在本项目中分发。
 
 ### 安装
 
@@ -152,6 +153,7 @@ runtime, so a separate Notepad++ installation is not required. The bridge
 source is MIT-licensed. The modified Notepad++ runtime remains GPLv3, with its
 complete corresponding source pinned at
 [`dgs-headless-8.5.7-1`](https://github.com/lmaoha/notepad-plus-plus/tree/dgs-headless-8.5.7-1).
+The same commit is referenced by the `third_party/notepad-plus-plus` submodule.
 Enterprise plugins and decryption components are not distributed here.
 
 ### Setup

@@ -5,6 +5,7 @@ Notepad++ version: 8.5.7 x64
 Executable SHA256: 4675EADE20530B7BFD1EDF9DF12CA165AB419DFA165B14A46539C6114E373573
 Corresponding source: https://github.com/lmaoha/notepad-plus-plus/tree/dgs-headless-8.5.7-1
 Modified source commit: 5e786a67bcb62ba4aee1a25ab5b554fbf630d8c7
+Source submodule: third_party\notepad-plus-plus @ 5e786a67bcb62ba4aee1a25ab5b554fbf630d8c7
 Official base commit: 5008b8a0cccfff255c5f48b5782ef993b6f9b631
 OriginalFilename: notepad++.exe
 InternalName: notepad++.exe

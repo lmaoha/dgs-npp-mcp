@@ -15,6 +15,7 @@ Complete corresponding source for the distributed executable:
 
 - Source tag: https://github.com/lmaoha/notepad-plus-plus/tree/dgs-headless-8.5.7-1
 - Modified source commit: `5e786a67bcb62ba4aee1a25ab5b554fbf630d8c7`
+- Git submodule: `third_party/notepad-plus-plus`, pinned to the modified source commit
 - Official base tag: https://github.com/notepad-plus-plus/notepad-plus-plus/tree/v8.5.7
 - Official base commit: `5008b8a0cccfff255c5f48b5782ef993b6f9b631`
 - Upstream build guide: https://github.com/lmaoha/notepad-plus-plus/blob/dgs-headless-8.5.7-1/BUILD.md
