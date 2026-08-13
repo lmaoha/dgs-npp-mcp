@@ -1044,6 +1044,41 @@ class StartupPlaceholderTests(unittest.TestCase):
             expected_buffer_id=777,
         )
 
+    def test_empty_startup_buffer_retained_after_tab_close_refusal(self) -> None:
+        with (
+            mock.patch.object(broker, "_capture_binding", return_value=self.binding),
+            mock.patch.object(broker.bridge, "activate_buffer_id", return_value=self.binding),
+            mock.patch.object(broker.bridge, "get_document_length", return_value=0),
+            mock.patch.object(broker, "_dirty", return_value=False),
+            mock.patch.object(broker, "_close_current_tab_if_clean", return_value=False) as close,
+        ):
+            result = broker._cleanup_startup_placeholder(self.state, 101)
+
+        self.assertEqual(result["status"], "retained_empty_startup_buffer")
+        self.assertEqual(result["bytes"], 0)
+        self.assertFalse(result["modified"])
+        self.assertFalse(result["changed"])
+        close.assert_called_once_with(
+            101,
+            202,
+            expected_path="new 1",
+            expected_buffer_id=777,
+        )
+
+    def test_startup_buffer_modified_after_tab_close_refusal_remains_protected(self) -> None:
+        with (
+            mock.patch.object(broker, "_capture_binding", return_value=self.binding),
+            mock.patch.object(broker.bridge, "activate_buffer_id", return_value=self.binding),
+            mock.patch.object(broker.bridge, "get_document_length", return_value=0),
+            mock.patch.object(broker, "_dirty", side_effect=[False, True]),
+            mock.patch.object(broker, "_close_current_tab_if_clean", return_value=False),
+        ):
+            result = broker._cleanup_startup_placeholder(self.state, 101)
+
+        self.assertEqual(result["status"], "close_refused")
+        self.assertTrue(result["modified"])
+        self.assertFalse(result["changed"])
+
     def test_nonempty_startup_buffer_remains_protected(self) -> None:
         with (
             mock.patch.object(broker, "_capture_binding", return_value=self.binding),
@@ -1087,6 +1122,54 @@ class StartupPlaceholderTests(unittest.TestCase):
     "set DGS_NPP_LIVE_TESTS=1 to exercise the bundled Notepad++ runtime",
 )
 class LiveBindingIntegrationTests(unittest.TestCase):
+    def test_only_empty_startup_buffer_shutdown_closes_headless_process(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            state_dir = root / "state"
+            state_file = state_dir / "npp-instance-broker.json"
+            open_files_file = state_dir / "open-files.json"
+            managed_settings = root / "managed-settings"
+            managed_settings.mkdir()
+            original_build_npp_args = broker.bridge.build_npp_args
+            managed_pid = None
+
+            with (
+                mock.patch.object(broker, "STATE_DIR", state_dir),
+                mock.patch.object(broker, "STATE_FILE", state_file),
+                mock.patch.object(broker, "OPEN_FILES_FILE", open_files_file),
+                mock.patch.object(
+                    broker.bridge,
+                    "build_npp_args",
+                    side_effect=lambda exe: original_build_npp_args(exe)
+                    + [f"-settingsDir={managed_settings}"],
+                ),
+            ):
+                try:
+                    managed_pid, top = broker._ensure_npp(15)
+                    state = broker._read_state() or {}
+                    binding = broker._capture_binding(
+                        top,
+                        expected_buffer_id=int(state["startup_buffer_id"]),
+                    )
+                    self.assertFalse(broker._is_real_file_path(str(binding["path"])))
+                    self.assertEqual(
+                        broker.bridge.get_document_length(int(binding["scintilla_hwnd"])),
+                        0,
+                    )
+                    self.assertFalse(broker._dirty(int(binding["scintilla_hwnd"])))
+
+                    shutdown = broker.dgs_shutdown({"wait_timeout": 5})
+
+                    self.assertTrue(shutdown["safe_to_stop"])
+                    self.assertEqual(
+                        shutdown["lifecycle"]["placeholder_actions"][0]["status"],
+                        "retained_empty_startup_buffer",
+                    )
+                    self.assertFalse(broker.bridge._is_pid_alive(managed_pid))
+                finally:
+                    if managed_pid and broker.bridge._is_pid_alive(managed_pid):
+                        broker._terminate_pid(managed_pid)
+
     def test_same_path_two_pids_100_reads_and_managed_only_shutdown(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
