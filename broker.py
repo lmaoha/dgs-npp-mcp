@@ -665,6 +665,26 @@ def _cleanup_startup_placeholder(state: dict[str, Any], top: int) -> dict[str, A
             expected_path=path,
             expected_buffer_id=startup_buffer_id,
         ):
+            retained = _capture_binding(
+                top,
+                expected_path=path,
+                expected_scin=scin,
+                expected_buffer_id=startup_buffer_id,
+            )
+            retained_scin = int(retained["scintilla_hwnd"])
+            retained_length = bridge.get_document_length(retained_scin)
+            retained_modified = _dirty(retained_scin)
+            _capture_binding(
+                top,
+                expected_path=path,
+                expected_scin=retained_scin,
+                expected_buffer_id=startup_buffer_id,
+            )
+            result["bytes"] = retained_length
+            result["modified"] = retained_modified
+            if retained_length == 0 and not retained_modified:
+                result["status"] = "retained_empty_startup_buffer"
+                return result
             result["status"] = "close_refused"
             return result
         result["status"] = "closed_empty_startup_buffer"

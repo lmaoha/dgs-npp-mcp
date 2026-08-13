@@ -223,9 +223,11 @@ class even when both open the same path.
 
 The broker records the empty startup BufferID. Shutdown may automatically close
 that placeholder only while the BufferID still matches, its path is not
-absolute, and its content is exactly zero bytes. Non-empty unnamed buffers,
-real files, mismatched BufferIDs, and unverified bindings remain quarantined;
-their content is never automatically saved or discarded.
+absolute, and its content is exactly zero bytes. If Notepad++ retains that last
+empty tab, the broker verifies the same buffer again and continues with the
+process-level close. Non-empty unnamed buffers, real files, mismatched
+BufferIDs, and unverified bindings remain quarantined; their content is never
+automatically saved or discarded.
 
 ### Tests
 
