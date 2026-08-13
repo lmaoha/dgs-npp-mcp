@@ -32,8 +32,9 @@ Scintilla 编辑缓冲区检索和修改文档。
 仓库包含完整的 Notepad++ 8.5.7 x64 headless 便携运行时，无需另外安装
 Notepad++。桥接源码使用 MIT 许可证；修改版 Notepad++ 继续使用 GPLv3，其完整
 对应源码固定在
-[`dgs-headless-8.5.7-1`](https://github.com/lmaoha/notepad-plus-plus/tree/dgs-headless-8.5.7-1)
-tag。企业插件和解密组件不在本项目中分发。
+[`dgs-headless-8.5.7-2`](https://github.com/lmaoha/notepad-plus-plus/tree/dgs-headless-8.5.7-2)
+tag，并通过 `third_party/notepad-plus-plus` submodule 引用同一提交。企业插件和
+解密组件不在本项目中分发。
 
 ### 安装
 
@@ -86,6 +87,16 @@ args = ['C:\path\to\dgs-npp-mcp\server.py']
 修改操作使用 `mtime` 和内容 SHA-256 做乐观并发检查。如果文件在搜索与保存之间
 发生变化，patch 会被拒绝。通信失败、超时或未确认保存时，桥不会盲目重试覆盖。
 
+从 0.8.4 起，每次缓冲区操作都验证同一份 `PID + path + Buffer ID + active view +
+Scintilla HWND` 快照。活动编辑区通过 Notepad++ 官方消息取得，不再根据窗口可见性
+或文本长度猜测。用户自己的 Notepad++ 与 headless 托管实例可以同时打开同一路径，
+两者仍按 PID 隔离。
+
+broker 会记录托管实例启动时的空白 Buffer ID。shutdown 只会自动关闭同时满足以下
+条件的占位标签：Buffer ID 与启动记录一致、路径不是绝对路径、内容严格为零字节。
+非空未命名标签、真实文件、Buffer ID 不匹配或绑定无法确认时仍保持隐藏隔离，不会
+自动保存或丢弃内容。
+
 ### 测试
 
 ```powershell
@@ -93,7 +104,13 @@ python -m unittest discover -s tests -v
 ```
 
 测试覆盖有界搜索、精确 patch、换行保留、并发保护、Unicode MCP 输入、worker
-stdin、保存失败恢复以及 Notepad++ 生命周期管理。
+stdin、保存失败恢复以及 Notepad++ 生命周期管理。额外的捆绑运行时集成测试会启动
+普通和 headless 两个隔离实例，对同一路径连续读取 100 次：
+
+```powershell
+$env:DGS_NPP_LIVE_TESTS = '1'
+python -m unittest tests.test_dgs_npp_mcp.LiveBindingIntegrationTests -v
+```
 
 ### 安全与许可证
 
@@ -135,7 +152,8 @@ The repository includes a complete portable Notepad++ 8.5.7 x64 headless
 runtime, so a separate Notepad++ installation is not required. The bridge
 source is MIT-licensed. The modified Notepad++ runtime remains GPLv3, with its
 complete corresponding source pinned at
-[`dgs-headless-8.5.7-1`](https://github.com/lmaoha/notepad-plus-plus/tree/dgs-headless-8.5.7-1).
+[`dgs-headless-8.5.7-2`](https://github.com/lmaoha/notepad-plus-plus/tree/dgs-headless-8.5.7-2).
+The same commit is referenced by the `third_party/notepad-plus-plus` submodule.
 Enterprise plugins and decryption components are not distributed here.
 
 ### Setup
@@ -196,6 +214,19 @@ concurrency tokens. A patch is refused if the source changes between search
 and save. Communication failures, timeouts, and unconfirmed saves are not
 blindly retried over the source.
 
+Since 0.8.4, every buffer operation verifies one stable
+`PID + path + BufferID + active view + Scintilla HWND` snapshot. The active
+editor is selected through Notepad++'s official message rather than inferred
+from visibility or text length. A user's interactive Notepad++ and the managed
+headless process remain isolated by PID, executable path, mutex, and window
+class even when both open the same path.
+
+The broker records the empty startup BufferID. Shutdown may automatically close
+that placeholder only while the BufferID still matches, its path is not
+absolute, and its content is exactly zero bytes. Non-empty unnamed buffers,
+real files, mismatched BufferIDs, and unverified bindings remain quarantined;
+their content is never automatically saved or discarded.
+
 ### Tests
 
 ```powershell
@@ -204,7 +235,14 @@ python -m unittest discover -s tests -v
 
 The suite covers bounded search, exact patching, newline preservation,
 concurrency protection, Unicode MCP input, worker stdin transport, save-failure
-recovery, and managed Notepad++ lifecycle behavior.
+recovery, and managed Notepad++ lifecycle behavior. The optional bundled-runtime
+test starts isolated normal and headless instances, opens the same path in both,
+and performs 100 verified reads:
+
+```powershell
+$env:DGS_NPP_LIVE_TESTS = '1'
+python -m unittest tests.test_dgs_npp_mcp.LiveBindingIntegrationTests -v
+```
 
 ### Security and license
 

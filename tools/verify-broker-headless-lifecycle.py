@@ -88,7 +88,7 @@ def main() -> int:
             for hwnd in broker.bridge._enum_toplevel():
                 if (
                     broker.bridge.window_process_id(hwnd) == pid
-                    and broker.bridge._get_class(hwnd) == "Notepad++"
+                    and broker.bridge._get_class(hwnd) == broker.bridge.DGS_NPP_WINDOW_CLASS
                 ):
                     visibility_samples.append(broker._window_visible(hwnd))
             time.sleep(0.005)

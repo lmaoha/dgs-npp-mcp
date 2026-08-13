@@ -31,6 +31,7 @@ k32 = ctypes.WinDLL("kernel32", use_last_error=True)
 PROCESS_VM_OPERATION = 0x0008
 PROCESS_VM_READ = 0x0010
 PROCESS_VM_WRITE = 0x0020
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 MEM_RESERVE = 0x2000
 MEM_COMMIT = 0x1000
 MEM_RELEASE = 0x8000
@@ -48,8 +49,11 @@ u32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
 u32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
 u32.GetWindowThreadProcessId.restype = wintypes.DWORD
 u32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+u32.IsWindow.argtypes = [wintypes.HWND]; u32.IsWindow.restype = wintypes.BOOL
 u32.SetForegroundWindow.argtypes = [wintypes.HWND]
 u32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+u32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+u32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
 u32.SendMessageW.restype = ctypes.c_ssize_t
 u32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
 u32.SendMessageTimeoutW.restype = ctypes.c_ssize_t
@@ -65,6 +69,16 @@ u32.SendMessageTimeoutW.argtypes = [
 
 k32.OpenProcess.restype = wintypes.HANDLE
 k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+if hasattr(k32, "QueryFullProcessImageNameW"):
+    k32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    k32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+k32.GetExitCodeProcess.restype = wintypes.BOOL
+k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
 k32.VirtualAllocEx.restype = wintypes.LPVOID
 k32.VirtualAllocEx.argtypes = [wintypes.HANDLE, wintypes.LPVOID, ctypes.c_size_t, wintypes.DWORD, wintypes.DWORD]
 k32.VirtualFreeEx.restype = wintypes.BOOL
@@ -104,11 +118,29 @@ SCI_SETTEXT = 2181
 SCI_GETLENGTH = 2003  # 这版 N++ 上不可靠, 仅作诊断
 SCI_GETCODEPAGE = 2137
 SCI_GETMODIFY = 2159
+SCI_SETSAVEPOINT = 2014
 NPPMSG = WM_USER + 1000
+NPPM_GETCURRENTSCINTILLA = NPPMSG + 4
+NPPM_GETNPPVERSION = NPPMSG + 50
+NPPM_ACTIVATEDOC = NPPMSG + 28
+NPPM_GETPOSFROMBUFFERID = NPPMSG + 57
+NPPM_GETCURRENTBUFFERID = NPPMSG + 60
+NPPM_RELOADBUFFERID = NPPMSG + 61
 NPPM_GETFULLCURRENTPATH = RUNCOMMAND_USER + 1
 NPPM_SWITCHTOFILE = NPPMSG + 37
 NPPM_SAVECURRENTFILEAS = NPPMSG + 78
 NPPM_DOOPEN = NPPMSG + 77
+
+MAIN_VIEW = 0
+SUB_VIEW = 1
+GWL_STYLE = -16
+GWL_EXSTYLE = -20
+WS_BORDER = 0x00800000
+WS_EX_CLIENTEDGE = 0x00000200
+
+NPP_WINDOW_CLASS = "Notepad++"
+DGS_NPP_WINDOW_CLASS = "DGS.Notepad++"
+NPP_WINDOW_CLASSES = (NPP_WINDOW_CLASS, DGS_NPP_WINDOW_CLASS)
 
 # ---------- 独占实例状态 ----------
 import os as _os
@@ -149,6 +181,92 @@ def _normal_exe_path(path):
     return _os.path.normcase(_os.path.realpath(_os.path.abspath(str(path))))
 
 
+def process_exe_path(pid):
+    """Return the normalized full image path for a live process."""
+    if not pid or not hasattr(k32, "QueryFullProcessImageNameW"):
+        return ""
+    h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not h:
+        return ""
+    try:
+        size = wintypes.DWORD(32768)
+        value = ctypes.create_unicode_buffer(size.value)
+        if not k32.QueryFullProcessImageNameW(h, 0, value, ctypes.byref(size)):
+            return ""
+        return _normal_exe_path(value.value)
+    finally:
+        k32.CloseHandle(h)
+
+
+class _VS_FIXEDFILEINFO(ctypes.Structure):
+    _fields_ = [
+        ("dwSignature", wintypes.DWORD),
+        ("dwStrucVersion", wintypes.DWORD),
+        ("dwFileVersionMS", wintypes.DWORD),
+        ("dwFileVersionLS", wintypes.DWORD),
+        ("dwProductVersionMS", wintypes.DWORD),
+        ("dwProductVersionLS", wintypes.DWORD),
+        ("dwFileFlagsMask", wintypes.DWORD),
+        ("dwFileFlags", wintypes.DWORD),
+        ("dwFileOS", wintypes.DWORD),
+        ("dwFileType", wintypes.DWORD),
+        ("dwFileSubtype", wintypes.DWORD),
+        ("dwFileDateMS", wintypes.DWORD),
+        ("dwFileDateLS", wintypes.DWORD),
+    ]
+
+
+def get_file_version(path):
+    """Read a PE file version without starting the executable."""
+    try:
+        version = ctypes.WinDLL("version", use_last_error=True)
+        version.GetFileVersionInfoSizeW.restype = wintypes.DWORD
+        version.GetFileVersionInfoSizeW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(wintypes.DWORD)]
+        version.GetFileVersionInfoW.restype = wintypes.BOOL
+        version.GetFileVersionInfoW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p]
+        version.VerQueryValueW.restype = wintypes.BOOL
+        version.VerQueryValueW.argtypes = [
+            ctypes.c_void_p,
+            wintypes.LPCWSTR,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(wintypes.UINT),
+        ]
+
+        ignored = wintypes.DWORD(0)
+        size = int(version.GetFileVersionInfoSizeW(str(path), ctypes.byref(ignored)))
+        if size <= 0:
+            return ""
+        data = ctypes.create_string_buffer(size)
+        if not version.GetFileVersionInfoW(str(path), 0, size, data):
+            return ""
+        value = ctypes.c_void_p()
+        length = wintypes.UINT(0)
+        if not version.VerQueryValueW(data, "\\", ctypes.byref(value), ctypes.byref(length)):
+            return ""
+        info = ctypes.cast(value, ctypes.POINTER(_VS_FIXEDFILEINFO)).contents
+        if info.dwSignature != 0xFEEF04BD:
+            return ""
+        parts = [
+            (info.dwFileVersionMS >> 16) & 0xFFFF,
+            info.dwFileVersionMS & 0xFFFF,
+            (info.dwFileVersionLS >> 16) & 0xFFFF,
+            info.dwFileVersionLS & 0xFFFF,
+        ]
+        while len(parts) > 3 and parts[-1] == 0:
+            parts.pop()
+        return ".".join(str(part) for part in parts)
+    except Exception:
+        return ""
+
+
+def expected_window_class(headless):
+    return DGS_NPP_WINDOW_CLASS if bool(headless) else NPP_WINDOW_CLASS
+
+
+def window_class_is_headless(class_name):
+    return str(class_name or "") == DGS_NPP_WINDOW_CLASS
+
+
 _MCP_DIR = Path(__file__).resolve().parent
 _BUNDLED_NPP_DIR = _MCP_DIR / "runtime" / "notepad-plus-plus-headless"
 BUNDLED_NPP_EXE = str(_BUNDLED_NPP_DIR / "notepad++.exe")
@@ -164,12 +282,20 @@ def _read_state():
     except Exception:
         return None
 
-def _write_state(pid, exe):
+def _write_state(pid, exe, headless=None):
     try:
         _os.makedirs(_STATE_DIR, exist_ok=True)
         import time as _t
+        payload = {
+            "pid": int(pid),
+            "exe": _normal_exe_path(exe),
+            "started_at": _t.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        if headless is not None:
+            payload["headless"] = bool(headless)
+            payload["window_class"] = expected_window_class(headless)
         with open(_STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump({"pid": int(pid), "exe": exe, "started_at": _t.strftime("%Y-%m-%d %H:%M:%S")}, f, ensure_ascii=False, indent=2)
+            json.dump(payload, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
@@ -182,7 +308,6 @@ def _clear_state():
 def _is_pid_alive(pid):
     if not pid:
         return False
-    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
     h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
     if not h:
         return False
@@ -211,6 +336,58 @@ def _get_class(hwnd):
     u32.GetClassNameW(hwnd, b, 256)
     return b.value
 
+
+def _is_npp_window_class(class_name):
+    return str(class_name or "") in NPP_WINDOW_CLASSES
+
+
+def get_window_identity(top_hwnd):
+    """Capture the process/window identity used to validate managed ownership."""
+    pid = int(window_process_id(top_hwnd))
+    class_name = _get_class(top_hwnd)
+    return {
+        "pid": pid,
+        "top_hwnd": int(top_hwnd),
+        "window_class": class_name,
+        "headless": window_class_is_headless(class_name),
+        "exe": process_exe_path(pid),
+    }
+
+
+def validate_window_identity(
+    top_hwnd,
+    *,
+    expected_pid=None,
+    expected_exe=None,
+    expected_headless=None,
+):
+    """Reject an HWND that is not the expected Notepad++ process and mode."""
+    identity = get_window_identity(top_hwnd)
+    if not identity["pid"] or (
+        expected_pid is not None and identity["pid"] != int(expected_pid)
+    ):
+        raise RuntimeError(
+            f"Notepad++ PID mismatch: expected={expected_pid} actual={identity['pid']}"
+        )
+    if not _is_npp_window_class(identity["window_class"]):
+        raise RuntimeError(
+            f"unexpected Notepad++ window class: {identity['window_class']!r}"
+        )
+    if expected_headless is not None and identity["headless"] != bool(expected_headless):
+        raise RuntimeError(
+            "Notepad++ launch-mode mismatch: "
+            f"expected_headless={bool(expected_headless)} actual={identity['headless']} "
+            f"class={identity['window_class']!r}"
+        )
+    if expected_exe:
+        actual_exe = identity["exe"]
+        if not actual_exe or actual_exe != _normal_exe_path(expected_exe):
+            raise RuntimeError(
+                "Notepad++ executable mismatch: "
+                f"expected={_normal_exe_path(expected_exe)!r} actual={actual_exe!r}"
+            )
+    return identity
+
 def _enum_toplevel():
     out = []
     WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
@@ -231,24 +408,77 @@ def _get_title(hwnd):
     u32.GetWindowTextW(hwnd, b, n + 2)
     return b.value
 
+
+_EDITOR_VIEW_CACHE = {}
+
+
+def _scintilla_children(top):
+    top_pid = window_process_id(top)
+    return [
+        child
+        for child in _enum_children(top)
+        if _get_class(child) == "Scintilla" and window_process_id(child) == top_pid
+    ]
+
+
+def _has_editor_border(hwnd):
+    style = int(u32.GetWindowLongPtrW(hwnd, GWL_STYLE))
+    exstyle = int(u32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE))
+    return bool((style & WS_BORDER) or (exstyle & WS_EX_CLIENTEDGE))
+
+
+def _discover_editor_view_map(top):
+    scins = _scintilla_children(top)
+    if len(scins) < 2:
+        raise RuntimeError(f"expected at least 2 Scintilla controls, got {len(scins)}")
+
+    bordered = [scin for scin in scins if _has_editor_border(scin)]
+    if len(bordered) == 2:
+        editors = bordered
+    else:
+        # Notepad++ 8.5.7 creates main then sub before its auxiliary Scintillas.
+        editors = scins[:2]
+
+    if editors[0] == editors[1]:
+        raise RuntimeError("Notepad++ returned duplicate editor Scintilla handles")
+    return {MAIN_VIEW: int(editors[0]), SUB_VIEW: int(editors[1])}
+
+
+def _editor_view_map(top):
+    pid = window_process_id(top)
+    key = (int(pid), int(top))
+    current = set(_scintilla_children(top))
+    cached = _EDITOR_VIEW_CACHE.get(key)
+    if cached and all(
+        hwnd in current
+        and u32.IsWindow(hwnd)
+        and window_process_id(hwnd) == pid
+        for hwnd in cached.values()
+    ):
+        return cached
+
+    discovered = _discover_editor_view_map(top)
+    _EDITOR_VIEW_CACHE[key] = discovered
+    return discovered
+
+
 def _pick_scintilla(top):
-    scins = [c for c in _enum_children(top) if _get_class(c) == "Scintilla"]
-    # 优先: 可见且 TEXTLENGTH>0
-    for s in scins:
-        if u32.IsWindowVisible(s) and u32.SendMessageW(s, SCI_GETTEXTLENGTH, 0, 0) > 0:
-            return s
-    # 退而求其次: 任意 TEXTLENGTH>0。隐藏/托盘模式下 Scintilla 可能不可见。
-    for s in scins:
-        if u32.SendMessageW(s, SCI_GETTEXTLENGTH, 0, 0) > 0:
-            return s
-    return scins[0] if scins else None
+    """Compatibility wrapper; core operations use the official active view."""
+    try:
+        return get_active_scintilla(top)[1]
+    except Exception:
+        try:
+            return _editor_view_map(top)[MAIN_VIEW]
+        except Exception:
+            scins = _scintilla_children(top)
+            return scins[0] if scins else None
 
 def iter_notepadpp(include_hidden=False):
     """枚举 Notepad++ 顶层窗口, 返回 (top_hwnd, scintilla_hwnd)。"""
     for top in _enum_toplevel():
         if not include_hidden and not u32.IsWindowVisible(top):
             continue
-        if _get_class(top) != "Notepad++":
+        if not _is_npp_window_class(_get_class(top)):
             continue
         scin = _pick_scintilla(top)
         if scin:
@@ -258,10 +488,14 @@ def find_notepadpp(include_hidden=False):
     """优先回 skill 独占实例的 (top, scin), 没有才回退到全局搜索。"""
     st = _read_state()
     if st and _is_pid_alive(st.get("pid")):
-        for top, scin in _get_pid_notepadpp(st["pid"], include_hidden=True):
+        filters = {
+            "expected_exe": st.get("exe"),
+            "expected_headless": st.get("headless") if "headless" in st else None,
+        }
+        for top, scin in _get_pid_notepadpp(st["pid"], include_hidden=True, **filters):
             if scin and u32.SendMessageW(scin, SCI_GETTEXTLENGTH, 0, 0) > 0:
                 return top, scin
-        for top, scin in _get_pid_notepadpp(st["pid"], include_hidden=True):
+        for top, scin in _get_pid_notepadpp(st["pid"], include_hidden=True, **filters):
             return top, scin
     for top, scin in iter_notepadpp(include_hidden=include_hidden):
         if u32.SendMessageW(scin, SCI_GETTEXTLENGTH, 0, 0) > 0:
@@ -274,7 +508,11 @@ def find_notepadpp_by_path(file_path, include_hidden=False):
     expected = normalize_path_for_compare(file_path)
     st = _read_state()
     if st and _is_pid_alive(st.get("pid")):
-        for top, scin in _get_pid_notepadpp(st["pid"], include_hidden=True):
+        filters = {
+            "expected_exe": st.get("exe"),
+            "expected_headless": st.get("headless") if "headless" in st else None,
+        }
+        for top, scin in _get_pid_notepadpp(st["pid"], include_hidden=True, **filters):
             current_path = get_current_file_path(top)
             if current_path and normalize_path_for_compare(current_path) == expected:
                 return top, scin
@@ -327,24 +565,42 @@ def _find_npp_exe():
 def npp_working_directory(exe):
     return _os.path.dirname(_os.path.abspath(str(exe)))
 
-def _get_pid_notepadpp(pid, include_hidden=True):
+def _get_pid_notepadpp(
+    pid,
+    include_hidden=True,
+    *,
+    expected_exe=None,
+    expected_headless=None,
+):
     """在同一 PID 下枚举 Notepad++ 主窗口, 返回 (top, scintilla) 列表。"""
     if not pid:
+        return []
+    pid = int(pid)
+    actual_exe = process_exe_path(pid) if expected_exe else None
+    if expected_exe and (not actual_exe or actual_exe != _normal_exe_path(expected_exe)):
         return []
     out = []
     for top in _enum_toplevel():
         if not include_hidden and not u32.IsWindowVisible(top):
             continue
-        if _get_class(top) != "Notepad++":
+        class_name = _get_class(top)
+        if not _is_npp_window_class(class_name):
             continue
-        if window_process_id(top) != int(pid):
+        if window_process_id(top) != pid:
+            continue
+        if expected_headless is not None and window_class_is_headless(class_name) != bool(expected_headless):
             continue
         scin = _pick_scintilla(top)
         out.append((top, scin))
     return out
 
-def _find_pid_top(pid):
-    for top, scin in _get_pid_notepadpp(pid, include_hidden=True):
+def _find_pid_top(pid, *, expected_exe=None, expected_headless=None):
+    for top, scin in _get_pid_notepadpp(
+        pid,
+        include_hidden=True,
+        expected_exe=expected_exe,
+        expected_headless=expected_headless,
+    ):
         return top, scin
     return None, None
 
@@ -353,17 +609,22 @@ def _ensure_dedicated_instance(wait_timeout=15.0, hide_window=True):
     import time, subprocess
     st = _read_state()
     if st and _is_pid_alive(st.get("pid")):
-        top, _ = _find_pid_top(st["pid"])
+        filters = {
+            "expected_exe": st.get("exe"),
+            "expected_headless": st.get("headless") if "headless" in st else None,
+        }
+        top, _ = _find_pid_top(st["pid"], **filters)
         if top:
             return int(st["pid"]), top
         deadline = time.time() + 3.0
         while time.time() < deadline:
             time.sleep(0.1)
-            top, _ = _find_pid_top(st["pid"])
+            top, _ = _find_pid_top(st["pid"], **filters)
             if top:
                 return int(st["pid"]), top
     exe = find_npp_exe()
     npp_args = build_npp_args(exe)
+    headless = any(str(arg).lower() in {"-headless", "--headless"} for arg in npp_args[1:])
     startupinfo = None
     creationflags = 0
     if hide_window:
@@ -374,11 +635,15 @@ def _ensure_dedicated_instance(wait_timeout=15.0, hide_window=True):
     proc = subprocess.Popen(npp_args, shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             startupinfo=startupinfo, creationflags=creationflags,
                             cwd=npp_working_directory(exe))
-    _write_state(proc.pid, exe)
+    _write_state(proc.pid, exe, headless=headless)
     deadline = time.time() + wait_timeout
     while time.time() < deadline:
         time.sleep(0.15)
-        top, _ = _find_pid_top(proc.pid)
+        top, _ = _find_pid_top(
+            proc.pid,
+            expected_exe=exe,
+            expected_headless=headless,
+        )
         if top:
             if hide_window:
                 u32.ShowWindow(top, SW_HIDE)
@@ -423,15 +688,17 @@ def open_file(file_path, switch_tab=True, wait_timeout=15.0, systemtray=False, h
         if u32.IsWindowVisible(top):
             u32.ShowWindow(top, SW_HIDE)
         pairs = _get_pid_notepadpp(pid, include_hidden=True)
-        for t, scin in pairs:
-            if not scin:
-                continue
+        for t, _ in pairs:
             switch_to_file_by_path(t, file_path)
-            current_path = get_current_file_path(t)
+            try:
+                binding = get_active_document_snapshot(t)
+            except Exception:
+                continue
+            current_path = binding["path"]
             if current_path and normalize_path_for_compare(current_path) == expected_path:
                 if u32.IsWindowVisible(t):
                     u32.ShowWindow(t, SW_HIDE)
-                return t, scin
+                return t, int(binding["scintilla_hwnd"])
     raise TimeoutError(f"skill 独占 N++ 打开 {file_path} 后 {wait_timeout}s 内未就绪")
 
 def _switch_to_tab_by_name(top_hwnd, name_lower):
@@ -496,12 +763,138 @@ def send_npp_text_message(top_hwnd, msg, text=None, buffer_chars=4096, wparam=No
             k32.VirtualFreeEx(h, remote, 0, MEM_RELEASE)
         k32.CloseHandle(h)
 
+
+def send_npp_int_out_message(top_hwnd, msg):
+    """Read an int* output parameter written inside the Notepad++ process."""
+    h, _ = _open_hwnd_process(top_hwnd)
+    remote = None
+    size = ctypes.sizeof(ctypes.c_int)
+    try:
+        remote = k32.VirtualAllocEx(h, None, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        if not remote:
+            raise OSError("VirtualAllocEx failed for Notepad++ integer output")
+
+        initial = ctypes.c_int(-1)
+        written = ctypes.c_size_t(0)
+        if not k32.WriteProcessMemory(h, remote, ctypes.byref(initial), size, ctypes.byref(written)):
+            raise OSError(f"WriteProcessMemory failed (err={ctypes.get_last_error()})")
+        if written.value != size:
+            raise OSError(f"short WriteProcessMemory: expected={size} actual={written.value}")
+
+        accepted = int(u32.SendMessageW(top_hwnd, msg, 0, remote))
+        result = ctypes.c_int(-1)
+        read = ctypes.c_size_t(0)
+        if not k32.ReadProcessMemory(h, remote, ctypes.byref(result), size, ctypes.byref(read)):
+            raise OSError(f"ReadProcessMemory failed (err={ctypes.get_last_error()})")
+        if read.value != size:
+            raise OSError(f"short ReadProcessMemory: expected={size} actual={read.value}")
+        if not accepted:
+            raise RuntimeError(f"Notepad++ rejected integer output message {msg}")
+        return int(result.value)
+    finally:
+        if remote:
+            k32.VirtualFreeEx(h, remote, 0, MEM_RELEASE)
+        k32.CloseHandle(h)
+
+
+def get_current_file_path_strict(top_hwnd):
+    ret, path = send_npp_text_message(top_hwnd, NPPM_GETFULLCURRENTPATH, buffer_chars=4096)
+    if ret < 0:
+        raise RuntimeError(f"NPPM_GETFULLCURRENTPATH failed with ret={ret}")
+    return path or ""
+
+
 def get_current_file_path(top_hwnd):
     try:
-        ret, path = send_npp_text_message(top_hwnd, NPPM_GETFULLCURRENTPATH, buffer_chars=4096)
-        return path if ret >= 0 and path else ""
+        return get_current_file_path_strict(top_hwnd)
     except Exception:
         return ""
+
+
+def get_current_buffer_id(top_hwnd):
+    buffer_id = int(u32.SendMessageW(top_hwnd, NPPM_GETCURRENTBUFFERID, 0, 0))
+    if buffer_id <= 0:
+        raise RuntimeError(f"Notepad++ returned an invalid current BufferID: {buffer_id}")
+    return buffer_id
+
+
+def get_active_scintilla(top_hwnd):
+    view = send_npp_int_out_message(top_hwnd, NPPM_GETCURRENTSCINTILLA)
+    if view not in (MAIN_VIEW, SUB_VIEW):
+        raise RuntimeError(f"invalid active Scintilla view: {view}")
+    scin = _editor_view_map(top_hwnd)[view]
+    top_pid = window_process_id(top_hwnd)
+    if not top_pid or window_process_id(scin) != top_pid:
+        raise RuntimeError("Scintilla and Notepad++ PID mismatch")
+    return view, scin
+
+
+def get_active_document_snapshot(top_hwnd, retries=5, retry_delay=0.05):
+    """Capture a stable PID/path/BufferID/view/HWND binding."""
+    import time
+
+    attempts = max(1, int(retries))
+    last = None
+    for attempt in range(attempts):
+        path1 = get_current_file_path_strict(top_hwnd)
+        buffer1 = get_current_buffer_id(top_hwnd)
+        view1, scin1 = get_active_scintilla(top_hwnd)
+        path2 = get_current_file_path_strict(top_hwnd)
+        buffer2 = get_current_buffer_id(top_hwnd)
+        view2, scin2 = get_active_scintilla(top_hwnd)
+        pid = window_process_id(top_hwnd)
+        last = {
+            "pid": int(pid),
+            "top_hwnd": int(top_hwnd),
+            "active_view": int(view2),
+            "scintilla_hwnd": int(scin2),
+            "buffer_id": int(buffer2),
+            "path": path2,
+        }
+        if (
+            pid
+            and path1 == path2
+            and buffer1 == buffer2
+            and view1 == view2
+            and scin1 == scin2
+            and window_process_id(scin2) == pid
+        ):
+            last["active_binding_verified"] = True
+            return last
+        if attempt + 1 < attempts:
+            time.sleep(max(0.0, float(retry_delay)))
+
+    raise RuntimeError(f"active Notepad++ document did not stabilize: {last}")
+
+
+def get_buffer_position(top_hwnd, buffer_id, priority_view=MAIN_VIEW):
+    position = int(u32.SendMessageW(top_hwnd, NPPM_GETPOSFROMBUFFERID, int(buffer_id), int(priority_view)))
+    if position == -1:
+        return None
+    view = (position >> 30) & 0x3
+    index = position & ((1 << 30) - 1)
+    if view not in (MAIN_VIEW, SUB_VIEW):
+        raise RuntimeError(f"invalid view encoded for BufferID {int(buffer_id)}: {view}")
+    return view, index
+
+
+def activate_buffer_id(top_hwnd, buffer_id, wait_timeout=2.0):
+    import time
+
+    position = get_buffer_position(top_hwnd, buffer_id)
+    if position is None:
+        return None
+    view, index = position
+    if not u32.SendMessageW(top_hwnd, NPPM_ACTIVATEDOC, view, index):
+        raise RuntimeError(f"Notepad++ rejected activation of BufferID {int(buffer_id)}")
+    deadline = time.monotonic() + max(0.0, float(wait_timeout))
+    while True:
+        snapshot = get_active_document_snapshot(top_hwnd)
+        if snapshot["buffer_id"] == int(buffer_id):
+            return snapshot
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"Notepad++ did not activate BufferID {int(buffer_id)}")
+        time.sleep(0.05)
 
 def switch_to_file_by_path(top_hwnd, file_path):
     try:
@@ -852,6 +1245,23 @@ def is_document_modified(scin):
         raise RuntimeError("Scintilla handle is required to inspect the modify state")
     return bool(u32.SendMessageW(scin, SCI_GETMODIFY, 0, 0))
 
+
+def get_document_length(scin):
+    if not scin:
+        raise RuntimeError("Scintilla handle is required to read the document length")
+    length = int(u32.SendMessageW(scin, SCI_GETTEXTLENGTH, 0, 0))
+    if length < 0:
+        raise RuntimeError(f"Scintilla returned an invalid document length: {length}")
+    return length
+
+
+def set_document_save_point(scin):
+    """Mark the current Scintilla document clean and verify the result."""
+    if not scin:
+        raise RuntimeError("Scintilla handle is required to set the save point")
+    u32.SendMessageW(scin, SCI_SETSAVEPOINT, 0, 0)
+    return not is_document_modified(scin)
+
 def write_document_bytes(scin, data):
     """把原编码文档字节写入 Scintilla 缓冲区 (替换全文)。返回写入字节数。"""
     alloc = len(data) + 16
@@ -963,7 +1373,7 @@ def main():
         WM_CLOSE = 0x0010
         closed_any = False
         for top in _enum_toplevel():
-            if _get_class(top) != "Notepad++":
+            if not _is_npp_window_class(_get_class(top)):
                 continue
             if window_process_id(top) != pid:
                 continue
