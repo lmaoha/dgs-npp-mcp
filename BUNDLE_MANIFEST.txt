@@ -18,3 +18,5 @@ MCP tests: python -m unittest discover -s tests -v
 Active binding live test: set DGS_NPP_LIVE_TESTS=1 and run LiveBindingIntegrationTests
 Focused workflow: dgs_search -> dgs_apply_patch (no full document in MCP arguments)
 Search engine: Python in-process literal/regex search; no rg.exe dependency
+Static tool contract: tool_contract.py
+Codex registration helper: install.ps1

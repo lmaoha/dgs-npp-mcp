@@ -45,17 +45,21 @@ git clone https://github.com/lmaoha/dgs-npp-mcp.git
 cd dgs-npp-mcp
 ```
 
-在 Codex 的配置中注册 `server.py`：
+运行安装脚本。脚本会定位 Python 的绝对路径，在缺少配置时注册 `dgs-npp`，
+并用独立的 `server.py` 进程完成 `initialize + tools/list` 探测：
 
-```toml
-[mcp_servers.dgs-npp]
-command = "python"
-args = ['C:\path\to\dgs-npp-mcp\server.py']
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
 默认会使用仓库中的 headless 运行时，不需要设置环境变量。如果需要诊断或使用
 另一份已获授权的运行时，可用 `NPP_EXE` 显式覆盖；仅当覆盖的运行时明确支持
-`-headless` 时才设置 `DGS_NPP_HEADLESS = '1'`。注册后重启 MCP 宿主。
+`-headless` 时才设置 `DGS_NPP_HEADLESS = '1'`。
+
+注册成功只表示 Codex 全局配置中已有 `dgs-npp`，不会热更新当前任务已经加载的
+工具快照。安装后请重启 Codex，再创建新任务或 Fork 旧任务。在新任务中先确认
+`dgs_list_open_files` 可调用，再用 `dgs_read_file`、`dgs_search` 等工具处理 DGS
+源码。安装脚本不会终止现有 Codex、broker 或 Notepad++ 进程。
 
 桥会按以下顺序选择可执行文件：
 
@@ -163,19 +167,25 @@ git clone https://github.com/lmaoha/dgs-npp-mcp.git
 cd dgs-npp-mcp
 ```
 
-Register `server.py` with Codex or another MCP host:
+Run the installer. It resolves an absolute Python executable, registers
+`dgs-npp` when the configuration is missing, and probes `initialize +
+tools/list` through an independent `server.py` process:
 
-```toml
-[mcp_servers.dgs-npp]
-command = "python"
-args = ['C:\path\to\dgs-npp-mcp\server.py']
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
 The bundled headless runtime is used by default, with no environment variables
 required. `NPP_EXE` is an explicit override for diagnostics or another
 authorized runtime. Set `DGS_NPP_HEADLESS=1` only if that override explicitly
-supports the `-headless` switch. Restart the MCP host after changing its
-configuration.
+supports the `-headless` switch.
+
+A successful registration only confirms that `dgs-npp` exists in Codex's
+global configuration; it does not hot-refresh the tool snapshot of an existing
+task. Restart Codex, then create a new task or fork the old task. Confirm that
+`dgs_list_open_files` is available before using `dgs_read_file`, `dgs_search`,
+or other DGS source tools. The installer does not terminate existing Codex,
+broker, or Notepad++ processes.
 
 Executable resolution order is:
 

@@ -13,6 +13,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from tool_contract import tools_list
+
 try:
     sys.stdin.reconfigure(encoding="utf-8", errors="strict")
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -202,8 +204,7 @@ def _terminate_pid(pid: int) -> bool:
 
 
 def _tools_list() -> list[dict[str, Any]]:
-    _start_broker()
-    return list(_broker_request({"id": "tools", "op": "tools/list"}, timeout=5.0).get("tools", []))
+    return tools_list()
 
 
 def _call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
