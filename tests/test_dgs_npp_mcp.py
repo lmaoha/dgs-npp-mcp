@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -15,6 +16,19 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import broker  # noqa: E402
+import server  # noqa: E402
+import tool_contract  # noqa: E402
+
+
+EXPECTED_TOOL_NAMES = {
+    "dgs_open_file",
+    "dgs_read_file",
+    "dgs_write_file",
+    "dgs_search",
+    "dgs_apply_patch",
+    "dgs_list_open_files",
+    "dgs_shutdown",
+}
 
 
 def active_binding(
@@ -39,18 +53,24 @@ def active_binding(
 
 class BridgeContractTests(unittest.TestCase):
     def test_public_tool_names_are_stable(self) -> None:
-        self.assertEqual(
-            set(broker.TOOLS),
-            {
-                "dgs_open_file",
-                "dgs_read_file",
-                "dgs_write_file",
-                "dgs_search",
-                "dgs_apply_patch",
-                "dgs_list_open_files",
-                "dgs_shutdown",
-            },
-        )
+        self.assertEqual(set(broker.TOOLS), EXPECTED_TOOL_NAMES)
+
+    def test_static_tool_contract_lists_all_public_tools(self) -> None:
+        listed = tool_contract.tools_list()
+
+        self.assertEqual(len(listed), 7)
+        self.assertEqual({item["name"] for item in listed}, EXPECTED_TOOL_NAMES)
+        self.assertEqual(set(broker.TOOLS), set(tool_contract.TOOL_SPECS))
+
+    def test_server_tool_list_does_not_start_broker(self) -> None:
+        with mock.patch.object(
+            server,
+            "_start_broker",
+            side_effect=AssertionError("tools/list must not start the broker"),
+        ):
+            listed = server._tools_list()
+
+        self.assertEqual({item["name"] for item in listed}, EXPECTED_TOOL_NAMES)
 
     def test_unexpected_binary_profile_detection_is_preserved(self) -> None:
         self.assertFalse(broker.bridge.has_unexpected_binary_profile(b"ordinary document text\n"))
@@ -1340,6 +1360,39 @@ class LiveBindingIntegrationTests(unittest.TestCase):
 
 
 class TransportTests(unittest.TestCase):
+    def test_standalone_tools_list_does_not_require_broker(self) -> None:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as port_socket:
+            port_socket.bind(("127.0.0.1", 0))
+            unused_port = port_socket.getsockname()[1]
+
+        request = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {},
+        }
+        env = {
+            **os.environ,
+            "DGS_NPP_BROKER_PORT": str(unused_port),
+            "DGS_NPP_PYTHON": str(ROOT / "missing-python.exe"),
+        }
+        completed = subprocess.run(
+            [sys.executable, str(ROOT / "server.py")],
+            input=(json.dumps(request) + "\n").encode("utf-8"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            timeout=10,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8", errors="replace"))
+        response = json.loads(completed.stdout.decode("utf-8"))
+        self.assertEqual(
+            {item["name"] for item in response["result"]["tools"]},
+            EXPECTED_TOOL_NAMES,
+        )
+
     def test_server_decodes_mcp_input_as_utf8(self) -> None:
         request = {
             "jsonrpc": "2.0",
