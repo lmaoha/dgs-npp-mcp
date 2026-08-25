@@ -1,5 +1,5 @@
 DGS Notepad++ MCP self-contained bundle
-MCP version: 0.8.4
+MCP version: 0.9.0
 Bundled runtime: runtime\notepad-plus-plus-headless\notepad++.exe
 Notepad++ version: 8.5.7 x64
 Executable SHA256: FD4DFD2A2F9677796498F4693C60EEC4101243C070EDAF24A1FDF891568FD2E0
@@ -20,3 +20,4 @@ Focused workflow: dgs_search -> dgs_apply_patch (no full document in MCP argumen
 Search engine: Python in-process literal/regex search; no rg.exe dependency
 Static tool contract: tool_contract.py
 Codex registration helper: install.ps1
+Compact DGS output: fixed for dgs_search/dgs_read_file; dgs_read_file supports line_start/line_end

@@ -81,8 +81,10 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 ### MCP 工具
 
 - `dgs_open_file`：打开文件，并用完整路径确认活动标签页。
-- `dgs_read_file`：从 Scintilla 缓冲区读取文本和字节信息。
-- `dgs_search`：执行文字或正则搜索，只返回有界上下文。
+- `dgs_read_file`：从 Scintilla 缓冲区读取文本；可用 `line_start` / `line_end`
+  只返回指定行，结果固定使用紧凑结构。
+- `dgs_search`：执行文字或正则搜索；固定只返回匹配行和后续 patch 所需的
+  完整文件 SHA-256、mtime、size。
 - `dgs_apply_patch`：精确替换文本，经 Notepad++ 保存并重新读取验证。
 - `dgs_write_file`：有意替换完整文档；常规源码修改优先使用 patch。
 - `dgs_list_open_files`：列出桥跟踪的文件和托管实例状态。
@@ -90,6 +92,22 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 修改操作使用 `mtime` 和内容 SHA-256 做乐观并发检查。如果文件在搜索与保存之间
 发生变化，patch 会被拒绝。通信失败、超时或未确认保存时，桥不会盲目重试覆盖。
+
+推荐的低 token 调用顺序：
+
+```json
+{"path":"TARGET.cpp","query":"FunctionName","max_matches":3}
+```
+
+如果需要查看命中位置附近的源码，再按返回行号读取小范围：
+
+```json
+{"path":"TARGET.cpp","line_start":317,"line_end":329}
+```
+
+bridge 内部仍读取完整 Scintilla 缓冲区并计算完整 SHA-256；只有返回给 MCP 客户端的
+文本和元数据被裁剪。固定的 `content` 使用 `路径:行号:文本`，同时保留精简的
+`structuredContent`，因此后续 `dgs_apply_patch` 的并发校验流程保持不变。
 
 从 0.8.4 起，每次缓冲区操作都验证同一份 `PID + path + Buffer ID + active view +
 Scintilla HWND` 快照。活动编辑区通过 Notepad++ 官方消息取得，不再根据窗口可见性
@@ -210,8 +228,11 @@ complete document does not need to enter MCP arguments.
 ### MCP tools
 
 - `dgs_open_file`: open a file and verify the active tab by full path.
-- `dgs_read_file`: read text and byte metadata from the Scintilla buffer.
-- `dgs_search`: run literal or regular-expression search with bounded context.
+- `dgs_read_file`: read text from the Scintilla buffer; use `line_start` /
+  `line_end` to return a narrow range. Results always use compact metadata.
+- `dgs_search`: run literal or regular-expression search. It always returns only
+  matching lines plus the full-document SHA-256, mtime, and size needed by a
+  later patch.
 - `dgs_apply_patch`: replace exact text, save through Notepad++, and verify the
   persisted result.
 - `dgs_write_file`: intentionally replace a complete document; use patch for
@@ -223,6 +244,24 @@ Mutations use exact modification times and a content SHA-256 as optimistic
 concurrency tokens. A patch is refused if the source changes between search
 and save. Communication failures, timeouts, and unconfirmed saves are not
 blindly retried over the source.
+
+Recommended low-token discovery call:
+
+```json
+{"path":"TARGET.cpp","query":"FunctionName","max_matches":3}
+```
+
+Read a small range only when more local context is needed:
+
+```json
+{"path":"TARGET.cpp","line_start":317,"line_end":329}
+```
+
+The bridge still reads the complete Scintilla buffer and computes the complete
+SHA-256 internally. Only the MCP response text and metadata are reduced.
+The fixed compact `content` uses `path:line:text`, while
+`structuredContent` retains the concurrency tokens required by
+`dgs_apply_patch`.
 
 Since 0.8.4, every buffer operation verifies one stable
 `PID + path + BufferID + active view + Scintilla HWND` snapshot. The active

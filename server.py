@@ -24,7 +24,7 @@ except Exception:
 
 
 SERVER_NAME = "dgs_npp_mcp"
-SERVER_VERSION = "0.8.4"
+SERVER_VERSION = "0.9.0"
 BROKER_HOST = "127.0.0.1"
 BROKER_PORT = int(os.environ.get("DGS_NPP_BROKER_PORT", "57931"))
 PYTHON_EXE = os.environ.get("DGS_NPP_PYTHON", sys.executable)
@@ -56,9 +56,33 @@ def _err(request_id: Any, code: int, message: str, data: Any = None) -> None:
     _json_line({"jsonrpc": "2.0", "id": request_id, "error": error})
 
 
+def _compact_content(data: dict[str, Any]) -> str:
+    path = str(data.get("path", ""))
+    matches = data.get("matches")
+    if isinstance(matches, list):
+        if not matches:
+            return f"{path}: no matches"
+        return "\n".join(
+            f"{path}:{int(match.get('line', 0))}:{match.get('text', '')}"
+            for match in matches
+        )
+
+    text = data.get("text")
+    if isinstance(text, str):
+        start = int(data.get("line_start", 1))
+        lines = text.splitlines()
+        if not lines:
+            return f"{path}:{start}:"
+        return "\n".join(
+            f"{path}:{start + index}:{line}" for index, line in enumerate(lines)
+        )
+
+    return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+
+
 def _tool_result(data: dict[str, Any], is_error: bool = False) -> dict[str, Any]:
     return {
-        "content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False, indent=2)}],
+        "content": [{"type": "text", "text": _compact_content(data)}],
         "structuredContent": data,
         "isError": is_error,
     }
@@ -228,7 +252,7 @@ def _dispatch(message: dict[str, Any]) -> None:
             "protocolVersion": params.get("protocolVersion", "2024-11-05"),
             "capabilities": {"tools": {}},
             "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
-            "instructions": "Use dgs_search and dgs_apply_patch for focused DGS source work so complete documents stay inside the bridge. Calls are serialized by one local broker and routed through the bundled headless Notepad++ runtime by default. Use dgs_write_file only for intentional complete-document replacement. NPP_EXE is an optional explicit runtime override. Do not use .dat snapshots.",
+            "instructions": "DGS search and reads always use compact output. Use dgs_search with a small max_matches for normal source discovery, then dgs_read_file with line_start/line_end for local context and dgs_apply_patch for focused edits. Calls are serialized by one local broker and routed through the bundled headless Notepad++ runtime by default. Use dgs_write_file only for intentional complete-document replacement. NPP_EXE is an optional explicit runtime override. Do not use .dat snapshots.",
         })
     elif method == "ping":
         _ok(request_id, {})
