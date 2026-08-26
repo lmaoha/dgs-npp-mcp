@@ -33,7 +33,7 @@ except Exception:
 
 
 SERVER_NAME = "dgs_npp_broker"
-SERVER_VERSION = "0.8.4"
+SERVER_VERSION = "0.9.0"
 BROKER_DIR = Path(__file__).resolve().parent
 STATE_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "dgs-npp-mcp"
 STATE_FILE = STATE_DIR / "npp-instance-broker.json"
@@ -103,14 +103,6 @@ def _err(request_id: Any, code: int, message: str, data: Any = None) -> None:
     _json_line({"jsonrpc": "2.0", "id": request_id, "error": error})
 
 
-def _tool_result(data: dict[str, Any], is_error: bool = False) -> dict[str, Any]:
-    return {
-        "content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False, indent=2)}],
-        "structuredContent": data,
-        "isError": is_error,
-    }
-
-
 def _broker_response(request_id: Any, result: dict[str, Any] | None = None, error: str | None = None) -> dict[str, Any]:
     if error is not None:
         return {"id": request_id, "ok": False, "error": error}
@@ -128,6 +120,13 @@ def _stat(path: str) -> dict[str, Any]:
         "mtime_ns": st.st_mtime_ns,
         "mtime_ns_exact": str(st.st_mtime_ns),
         "mtime": st.st_mtime,
+    }
+
+
+def _compact_source(source: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "mtime_ns_exact": str(source["mtime_ns_exact"]),
+        "size": int(source["size"]),
     }
 
 
@@ -216,14 +215,11 @@ def _search_text(
     *,
     regex: bool = False,
     case_sensitive: bool = True,
-    context_lines: int = 2,
     max_matches: int = 50,
     max_output_chars: int = 20_000,
 ) -> dict[str, Any]:
     if not query:
         raise ValueError("query must not be empty")
-    if not 0 <= context_lines <= 20:
-        raise ValueError("context_lines must be between 0 and 20")
     if not 1 <= max_matches <= 500:
         raise ValueError("max_matches must be between 1 and 500")
     if not 1_000 <= max_output_chars <= 200_000:
@@ -243,23 +239,8 @@ def _search_text(
     for line_index, line_text in enumerate(lines):
         for match in pattern.finditer(line_text):
             total_matches += 1
-            before = [
-                {"line": index + 1, "text": lines[index]}
-                for index in range(max(0, line_index - context_lines), line_index)
-            ]
-            after = [
-                {"line": index + 1, "text": lines[index]}
-                for index in range(line_index + 1, min(len(lines), line_index + context_lines + 1))
-            ]
-            entry = {
-                "line": line_index + 1,
-                "column": match.start() + 1,
-                "end_column": match.end() + 1,
-                "text": line_text,
-                "before": before,
-                "after": after,
-            }
-            entry_chars = len(line_text) + sum(len(item["text"]) for item in before + after)
+            entry = {"line": line_index + 1, "text": line_text}
+            entry_chars = len(line_text)
             if len(matches) >= max_matches or returned_chars + entry_chars > max_output_chars:
                 output_truncated = True
                 continue
@@ -272,6 +253,39 @@ def _search_text(
         "total_matches": total_matches,
         "truncated": output_truncated,
         "returned_chars": returned_chars,
+    }
+
+
+def _select_line_range(
+    text: str,
+    line_start: int | None = None,
+    line_end: int | None = None,
+) -> dict[str, Any]:
+    lines = text.splitlines(keepends=True)
+    total_lines = len(lines)
+    if line_start is None and line_end is None:
+        return {
+            "text": text,
+            "line_start": 1 if total_lines else 0,
+            "line_end": total_lines,
+            "total_lines": total_lines,
+        }
+
+    start = 1 if line_start is None else int(line_start)
+    end = total_lines if line_end is None else int(line_end)
+    if start < 1 or end < 1:
+        raise ValueError("line_start and line_end must be at least 1")
+    if end < start:
+        raise ValueError("line_end must be greater than or equal to line_start")
+    if total_lines == 0 or start > total_lines:
+        raise ValueError(f"line range starts outside the document: {start}")
+
+    selected_end = min(end, total_lines)
+    return {
+        "text": "".join(lines[start - 1:selected_end]),
+        "line_start": start,
+        "line_end": selected_end,
+        "total_lines": total_lines,
     }
 
 
@@ -1699,6 +1713,9 @@ def dgs_read_file(args: dict[str, Any]) -> dict[str, Any]:
     auto_reload = bool(args.get("auto_reload", True))
     include_base64 = bool(args.get("include_base64", False))
     max_text_chars = int(args.get("max_text_chars", 200000))
+    line_start = args.get("line_start")
+    line_end = args.get("line_end")
+
     def action() -> dict[str, Any]:
         top, scin, path_abs = _activate(path, wait_timeout)
         meta = _prepare_document(
@@ -1718,38 +1735,24 @@ def dgs_read_file(args: dict[str, Any]) -> dict[str, Any]:
         meta["binding"] = snapshot["binding"]
         data = snapshot["data"]
         text = snapshot["text"]
-        code_page = snapshot["code_page"]
-        encoding = snapshot["encoding"]
-        had_decode_errors = snapshot["had_decode_errors"]
-        byte_info = snapshot["byte_info"]
-        truncated = max_text_chars >= 0 and len(text) > max_text_chars
-        shown_text = text[:max_text_chars] if truncated else text
+        selected = _select_line_range(text, line_start, line_end)
+        selected_text = selected["text"]
+        truncated = max_text_chars >= 0 and len(selected_text) > max_text_chars
+        shown_text = selected_text[:max_text_chars] if truncated else selected_text
+        _finish_read_tab(path_abs, top, scin, meta)
         result = {
             "ok": True,
             "path": path_abs,
-            "bytes": len(data),
-            "chars": len(text),
+            "line_start": selected["line_start"],
+            "line_end": selected["line_end"],
+            "total_lines": selected["total_lines"],
             "text": shown_text,
             "truncated": truncated,
-            "code_page": code_page,
-            "encoding": encoding,
-            "had_decode_errors": had_decode_errors,
-            "bom": byte_info["bom"],
-            "newline": byte_info["newline"],
-            "newline_counts": byte_info["newline_counts"],
-            "dirty": meta["dirty"],
-            "external_changed": meta["external_changed"],
-            "auto_reloaded": meta["auto_reloaded"],
-            "source": meta["source"],
-            "unexpected_binary_profile": bridge.has_unexpected_binary_profile(data),
             "content_sha256": snapshot["sha256"],
-            "title_dirty": meta["title_dirty"],
-            "dirty_recovered": meta["dirty_recovered"],
+            "source": _compact_source(meta["source"]),
         }
         if include_base64:
             result["bytes_base64"] = base64.b64encode(data).decode("ascii")
-        result.update(_finish_read_tab(path_abs, top, scin, meta))
-        result["source"] = meta["source"]
         return result
     with LOCK:
         return _with_npp_recovery(action)
@@ -1907,32 +1910,21 @@ def dgs_search(args: dict[str, Any]) -> dict[str, Any]:
             query,
             regex=bool(args.get("regex", False)),
             case_sensitive=bool(args.get("case_sensitive", True)),
-            context_lines=int(args.get("context_lines", 2)),
             max_matches=int(args.get("max_matches", 50)),
             max_output_chars=int(args.get("max_output_chars", 20_000)),
         )
+        _finish_read_tab(path_abs, top, scin, meta)
         result = {
             "ok": True,
             "path": path_abs,
             "query": query,
-            "regex": bool(args.get("regex", False)),
-            "case_sensitive": bool(args.get("case_sensitive", True)),
-            "bytes": len(snapshot["data"]),
-            "chars": len(snapshot["text"]),
-            "code_page": snapshot["code_page"],
-            "encoding": snapshot["encoding"],
-            "had_decode_errors": snapshot["had_decode_errors"],
+            "matches": search["matches"],
+            "returned_matches": search["returned_matches"],
+            "total_matches": search["total_matches"],
+            "truncated": search["truncated"],
             "content_sha256": snapshot["sha256"],
-            "source": meta["source"],
-            "dirty": meta["dirty"],
-            "external_changed": meta["external_changed"],
-            "auto_reloaded": meta["auto_reloaded"],
-            "title_dirty": meta["title_dirty"],
-            "dirty_recovered": meta["dirty_recovered"],
-            **search,
+            "source": _compact_source(meta["source"]),
         }
-        result.update(_finish_read_tab(path_abs, top, scin, meta))
-        result["source"] = meta["source"]
         return result
 
     with LOCK:

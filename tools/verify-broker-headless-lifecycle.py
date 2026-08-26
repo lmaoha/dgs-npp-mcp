@@ -99,7 +99,6 @@ def main() -> int:
         result = broker_call("dgs_search", {
             "path": path_abs,
             "query": args.query,
-            "context_lines": 1,
         })
     finally:
         stop_polling.set()

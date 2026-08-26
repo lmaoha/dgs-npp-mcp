@@ -25,7 +25,7 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
     },
     "dgs_read_file": {
-        "description": "Read document text and bytes from the Notepad++ Scintilla buffer. Does not create .dat snapshots.",
+        "description": "Read document text from the Notepad++ Scintilla buffer using fixed compact output. Optional line ranges keep large responses small. Does not create .dat snapshots.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -34,6 +34,8 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
                 "auto_reload": {"type": "boolean", "default": True},
                 "include_base64": {"type": "boolean", "default": False},
                 "max_text_chars": {"type": "integer", "default": 200000, "description": "Maximum decoded text chars to include; set -1 for full text."},
+                "line_start": {"type": "integer", "minimum": 1, "description": "Optional inclusive 1-based first line to return."},
+                "line_end": {"type": "integer", "minimum": 1, "description": "Optional inclusive 1-based last line to return."},
                 "worker_timeout": {"type": "number", "default": 20, "description": "Hard timeout in seconds for the broker worker process."},
             },
             "required": ["path"],
@@ -71,7 +73,7 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
         "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
     },
     "dgs_search": {
-        "description": "Search a DGS document inside the MCP-managed Scintilla buffer and return only matching lines and bounded context.",
+        "description": "Search a DGS document inside the MCP-managed Scintilla buffer using fixed compact output with rg-style matching lines and the concurrency metadata needed for patching.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -79,7 +81,6 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
                 "query": {"type": "string", "description": "Literal text or regular expression to search for."},
                 "regex": {"type": "boolean", "default": False},
                 "case_sensitive": {"type": "boolean", "default": True},
-                "context_lines": {"type": "integer", "minimum": 0, "maximum": 20, "default": 2},
                 "max_matches": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50},
                 "max_output_chars": {"type": "integer", "minimum": 1000, "maximum": 200000, "default": 20000},
                 "wait_timeout": {"type": "number", "default": 15},

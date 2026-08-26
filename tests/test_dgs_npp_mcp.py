@@ -61,6 +61,13 @@ class BridgeContractTests(unittest.TestCase):
         self.assertEqual(len(listed), 7)
         self.assertEqual({item["name"] for item in listed}, EXPECTED_TOOL_NAMES)
         self.assertEqual(set(broker.TOOLS), set(tool_contract.TOOL_SPECS))
+        read_properties = tool_contract.TOOL_SPECS["dgs_read_file"]["inputSchema"]["properties"]
+        search_properties = tool_contract.TOOL_SPECS["dgs_search"]["inputSchema"]["properties"]
+        self.assertIn("line_start", read_properties)
+        self.assertIn("line_end", read_properties)
+        self.assertNotIn("compact", read_properties)
+        self.assertNotIn("compact", search_properties)
+        self.assertNotIn("context_lines", search_properties)
 
     def test_server_tool_list_does_not_start_broker(self) -> None:
         with mock.patch.object(
@@ -234,20 +241,18 @@ class MtimeTests(unittest.TestCase):
 
 
 class SearchTests(unittest.TestCase):
-    def test_literal_search_returns_bounded_line_context(self) -> None:
+    def test_literal_search_returns_only_matching_lines(self) -> None:
         result = broker._search_text(
             "first\nalpha one\nmiddle\nalpha two\nlast\n",
             "alpha",
-            context_lines=1,
         )
 
         self.assertEqual(result["total_matches"], 2)
         self.assertEqual(result["returned_matches"], 2)
-        self.assertEqual(result["matches"][0]["line"], 2)
-        self.assertEqual(result["matches"][0]["column"], 1)
-        self.assertEqual(result["matches"][0]["before"], [{"line": 1, "text": "first"}])
-        self.assertEqual(result["matches"][0]["after"], [{"line": 3, "text": "middle"}])
-        self.assertNotIn("first\nalpha one", result)
+        self.assertEqual(result["matches"], [
+            {"line": 2, "text": "alpha one"},
+            {"line": 4, "text": "alpha two"},
+        ])
 
     def test_regex_search_can_ignore_case_and_limit_results(self) -> None:
         result = broker._search_text(
@@ -255,7 +260,6 @@ class SearchTests(unittest.TestCase):
             r"alpha\s+\d+",
             regex=True,
             case_sensitive=False,
-            context_lines=0,
             max_matches=2,
         )
 
@@ -266,6 +270,156 @@ class SearchTests(unittest.TestCase):
     def test_regex_that_matches_empty_text_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "empty text"):
             broker._search_text("abc", r".*", regex=True)
+
+class CompactReadTests(unittest.TestCase):
+    def test_line_range_is_inclusive_and_preserves_source_newlines(self) -> None:
+        result = broker._select_line_range("one\r\ntwo\r\nthree\r\n", 2, 3)
+
+        self.assertEqual(result["text"], "two\r\nthree\r\n")
+        self.assertEqual(result["line_start"], 2)
+        self.assertEqual(result["line_end"], 3)
+        self.assertEqual(result["total_lines"], 3)
+
+    def test_line_range_rejects_reversed_bounds(self) -> None:
+        with self.assertRaisesRegex(ValueError, "greater than or equal"):
+            broker._select_line_range("one\ntwo\n", 2, 1)
+
+    def test_read_keeps_patch_tokens_and_omits_diagnostics(self) -> None:
+        path = r"C:\work\target.cpp"
+        binding = active_binding(path=path)
+        meta = {
+            "binding": binding,
+            "dirty": False,
+            "external_changed": False,
+            "auto_reloaded": False,
+            "source": {"size": 14, "mtime_ns": 123, "mtime_ns_exact": "123", "mtime": 0.123},
+            "title_dirty": False,
+            "dirty_recovered": False,
+        }
+        snapshot = {
+            "binding": binding,
+            "data": b"one\ntwo\nthree\n",
+            "text": "one\ntwo\nthree\n",
+            "code_page": 65001,
+            "encoding": "utf-8",
+            "had_decode_errors": False,
+            "byte_info": {"bom": "none", "newline": "lf", "newline_counts": {"lf": 3}},
+            "sha256": "a" * 64,
+        }
+        lifecycle = {
+            "tab_closed": True,
+            "lifecycle": {"status": "closed"},
+            **active_binding(path=path),
+        }
+        def finish_read(*_args: object) -> dict:
+            meta["source"] = {"size": 15, "mtime_ns": 124, "mtime_ns_exact": "124", "mtime": 0.124}
+            return lifecycle
+
+        with (
+            mock.patch.object(broker, "_activate", return_value=(101, 201, path)),
+            mock.patch.object(broker, "_prepare_document", return_value=meta),
+            mock.patch.object(broker, "_read_buffer_snapshot", return_value=snapshot),
+            mock.patch.object(broker, "_finish_read_tab", side_effect=finish_read) as finish,
+        ):
+            result = broker.dgs_read_file({
+                "path": path,
+                "line_start": 2,
+                "line_end": 3,
+            })
+
+        self.assertEqual(result, {
+            "ok": True,
+            "path": path,
+            "line_start": 2,
+            "line_end": 3,
+            "total_lines": 3,
+            "text": "two\nthree\n",
+            "truncated": False,
+            "content_sha256": "a" * 64,
+            "source": {"mtime_ns_exact": "124", "size": 15},
+        })
+        finish.assert_called_once()
+
+    def test_search_keeps_patch_tokens_and_omits_diagnostics(self) -> None:
+        path = r"C:\work\target.cpp"
+        binding = active_binding(path=path)
+        meta = {
+            "binding": binding,
+            "dirty": False,
+            "external_changed": False,
+            "auto_reloaded": False,
+            "source": {"size": 10, "mtime_ns": 456, "mtime_ns_exact": "456", "mtime": 0.456},
+            "title_dirty": False,
+            "dirty_recovered": False,
+        }
+        snapshot = {
+            "binding": binding,
+            "data": b"alpha\nbeta\n",
+            "text": "alpha\nbeta\n",
+            "code_page": 65001,
+            "encoding": "utf-8",
+            "had_decode_errors": False,
+            "byte_info": {"bom": "none", "newline": "lf", "newline_counts": {"lf": 2}},
+            "sha256": "b" * 64,
+        }
+        def finish_search(*_args: object) -> dict:
+            meta["source"] = {"size": 11, "mtime_ns": 457, "mtime_ns_exact": "457", "mtime": 0.457}
+            return {"lifecycle": {"status": "closed"}}
+
+        with (
+            mock.patch.object(broker, "_activate", return_value=(101, 201, path)),
+            mock.patch.object(broker, "_prepare_document", return_value=meta),
+            mock.patch.object(broker, "_read_buffer_snapshot", return_value=snapshot),
+            mock.patch.object(broker, "_finish_read_tab", side_effect=finish_search),
+        ):
+            result = broker.dgs_search({"path": path, "query": "alpha"})
+
+        self.assertEqual(result, {
+            "ok": True,
+            "path": path,
+            "query": "alpha",
+            "matches": [{"line": 1, "text": "alpha"}],
+            "returned_matches": 1,
+            "total_matches": 1,
+            "truncated": False,
+            "content_sha256": "b" * 64,
+            "source": {"mtime_ns_exact": "457", "size": 11},
+        })
+
+
+class CompactToolResultTests(unittest.TestCase):
+    def test_search_content_uses_rg_style_lines(self) -> None:
+        data = {
+            "ok": True,
+            "path": r"C:\work\target.cpp",
+            "matches": [
+                {"line": 4, "text": "first match"},
+                {"line": 9, "text": "second match"},
+            ],
+        }
+
+        result = server._tool_result(data)
+
+        self.assertEqual(
+            result["content"][0]["text"],
+            "C:\\work\\target.cpp:4:first match\nC:\\work\\target.cpp:9:second match",
+        )
+        self.assertIs(result["structuredContent"], data)
+
+    def test_read_content_numbers_selected_lines(self) -> None:
+        data = {
+            "ok": True,
+            "path": r"C:\work\target.cpp",
+            "line_start": 17,
+            "text": "line one\nline two\n",
+        }
+
+        result = server._tool_result(data)
+
+        self.assertEqual(
+            result["content"][0]["text"],
+            "C:\\work\\target.cpp:17:line one\nC:\\work\\target.cpp:18:line two",
+        )
 
 
 class ExactPatchTests(unittest.TestCase):
