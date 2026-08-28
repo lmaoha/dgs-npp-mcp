@@ -1,8 +1,8 @@
 Bundled runtime: Notepad++ 8.5.7 x64 headless build
 Executable: notepad++.exe
-SHA256: FD4DFD2A2F9677796498F4693C60EEC4101243C070EDAF24A1FDF891568FD2E0
-Corresponding source: https://github.com/lmaoha/notepad-plus-plus/tree/dgs-headless-8.5.7-2
-Modified source commit: 92bfba7d06fc7ece814d639e65291be9352afb15
+SHA256: 17DE13A2D3093D2E8D5916DD37E7B18C1941611E5FCD25DE27565581DB832C78
+Corresponding source: https://github.com/lmaoha/notepad-plus-plus/tree/dgs-headless-8.5.7-3
+Modified source commit: b01ff1d8d6d36df70ecff62a7f6ad857b97fb07e
 Official base commit: 5008b8a0cccfff255c5f48b5782ef993b6f9b631
 OriginalFilename: notepad++.exe
 InternalName: notepad++.exe

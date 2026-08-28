@@ -24,7 +24,7 @@ except Exception:
 
 
 SERVER_NAME = "dgs_npp_mcp"
-SERVER_VERSION = "0.9.0"
+SERVER_VERSION = "0.9.1"
 BROKER_HOST = "127.0.0.1"
 BROKER_PORT = int(os.environ.get("DGS_NPP_BROKER_PORT", "57931"))
 PYTHON_EXE = os.environ.get("DGS_NPP_PYTHON", sys.executable)

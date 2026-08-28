@@ -33,7 +33,7 @@ except Exception:
 
 
 SERVER_NAME = "dgs_npp_broker"
-SERVER_VERSION = "0.9.0"
+SERVER_VERSION = "0.9.1"
 BROKER_DIR = Path(__file__).resolve().parent
 STATE_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "dgs-npp-mcp"
 STATE_FILE = STATE_DIR / "npp-instance-broker.json"
@@ -616,7 +616,7 @@ def _restore_active_buffer(top: int, original: dict[str, Any] | None) -> None:
 
 
 def _cleanup_startup_placeholder(state: dict[str, Any], top: int) -> dict[str, Any]:
-    """Close only the recorded, unnamed, zero-byte startup buffer."""
+    """Discard and close only the recorded unnamed startup buffer."""
     result: dict[str, Any] = {"status": "not_recorded", "changed": False}
     if not _state_is_headless(state):
         result["status"] = "not_headless"
@@ -643,6 +643,9 @@ def _cleanup_startup_placeholder(state: dict[str, Any], top: int) -> dict[str, A
         result.update(_binding_result(binding))
         path = str(binding.get("path") or "")
         if _is_real_file_path(path):
+            if _norm(path) in _load_open_files():
+                result["status"] = "reused_as_tracked_file"
+                return result
             result["status"] = "protected_real_file"
             return result
 
@@ -657,8 +660,31 @@ def _cleanup_startup_placeholder(state: dict[str, Any], top: int) -> dict[str, A
         result["bytes"] = length
         result["modified"] = _dirty(scin)
         if length != 0:
-            result["status"] = "protected_nonempty"
-            return result
+            result["discarded_bytes"] = length
+            try:
+                written = bridge.write_document_bytes(scin, b"")
+            except Exception as exc:
+                result["status"] = "clear_failed"
+                result["error"] = f"{type(exc).__name__}: {exc}"
+                return result
+            if written != 0:
+                result["status"] = "clear_failed"
+                result["written_bytes"] = written
+                return result
+            result["changed"] = True
+            binding = _capture_binding(
+                top,
+                expected_path=path,
+                expected_scin=scin,
+                expected_buffer_id=startup_buffer_id,
+            )
+            cleared_length = bridge.get_document_length(scin)
+            result["bytes"] = cleared_length
+            result["modified"] = _dirty(scin)
+            if cleared_length != 0:
+                result["status"] = "post_clear_validation_failed"
+                return result
+            result["content_cleared"] = True
 
         if result["modified"]:
             if not bridge.set_document_save_point(scin):
@@ -770,7 +796,8 @@ def _release_managed_npp(
     window_states: list[dict[str, Any]] = []
     unsafe_placeholder_statuses = {
         "protected_real_file",
-        "protected_nonempty",
+        "clear_failed",
+        "post_clear_validation_failed",
         "savepoint_failed",
         "post_savepoint_validation_failed",
         "close_refused",

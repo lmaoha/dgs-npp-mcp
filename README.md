@@ -32,7 +32,7 @@ Scintilla 编辑缓冲区检索和修改文档。
 仓库包含完整的 Notepad++ 8.5.7 x64 headless 便携运行时，无需另外安装
 Notepad++。桥接源码使用 MIT 许可证；修改版 Notepad++ 继续使用 GPLv3，其完整
 对应源码固定在
-[`dgs-headless-8.5.7-2`](https://github.com/lmaoha/notepad-plus-plus/tree/dgs-headless-8.5.7-2)
+[`dgs-headless-8.5.7-3`](https://github.com/lmaoha/notepad-plus-plus/tree/dgs-headless-8.5.7-3)
 tag，并通过 `third_party/notepad-plus-plus` submodule 引用同一提交。企业插件和
 解密组件不在本项目中分发。
 
@@ -114,10 +114,11 @@ Scintilla HWND` 快照。活动编辑区通过 Notepad++ 官方消息取得，�
 或文本长度猜测。用户自己的 Notepad++ 与 headless 托管实例可以同时打开同一路径，
 两者仍按 PID 隔离。
 
-broker 会记录托管实例启动时的空白 Buffer ID。shutdown 只会自动关闭同时满足以下
-条件的占位标签：Buffer ID 与启动记录一致、路径不是绝对路径、内容严格为零字节。
-非空未命名标签、真实文件、Buffer ID 不匹配或绑定无法确认时仍保持隐藏隔离，不会
-自动保存或丢弃内容。
+broker 会记录托管实例启动时的空白 Buffer ID。shutdown 只会处理同时满足以下条件
+的占位标签：Buffer ID 与启动记录一致、路径不是绝对路径、PID、可执行文件和无头
+窗口身份仍与托管状态一致。即使这个专用占位标签意外收到键盘输入，broker 也会清空
+它、设置并验证保存点，再关闭标签或整个进程。真实文件、Buffer ID 不匹配、绑定或
+清空校验失败时仍保持隐藏隔离。
 
 ### 测试
 
@@ -174,7 +175,7 @@ The repository includes a complete portable Notepad++ 8.5.7 x64 headless
 runtime, so a separate Notepad++ installation is not required. The bridge
 source is MIT-licensed. The modified Notepad++ runtime remains GPLv3, with its
 complete corresponding source pinned at
-[`dgs-headless-8.5.7-2`](https://github.com/lmaoha/notepad-plus-plus/tree/dgs-headless-8.5.7-2).
+[`dgs-headless-8.5.7-3`](https://github.com/lmaoha/notepad-plus-plus/tree/dgs-headless-8.5.7-3).
 The same commit is referenced by the `third_party/notepad-plus-plus` submodule.
 Enterprise plugins and decryption components are not distributed here.
 
@@ -270,13 +271,14 @@ from visibility or text length. A user's interactive Notepad++ and the managed
 headless process remain isolated by PID, executable path, mutex, and window
 class even when both open the same path.
 
-The broker records the empty startup BufferID. Shutdown may automatically close
-that placeholder only while the BufferID still matches, its path is not
-absolute, and its content is exactly zero bytes. If Notepad++ retains that last
-empty tab, the broker verifies the same buffer again and continues with the
-process-level close. Non-empty unnamed buffers, real files, mismatched
-BufferIDs, and unverified bindings remain quarantined; their content is never
-automatically saved or discarded.
+The broker records the empty startup BufferID. Shutdown handles that placeholder
+only while the BufferID still matches, its path is not absolute, and the PID,
+executable, and headless window identity still match managed state. If this
+dedicated placeholder receives accidental keyboard input, the broker clears it,
+sets and verifies its save point, then closes the tab or process. If Notepad++
+reuses that BufferID for a broker-tracked real file, normal tracked-file
+lifecycle handling takes over. Untracked real files, mismatched BufferIDs, and
+failed binding or clear verification remain quarantined.
 
 ### Tests
 
