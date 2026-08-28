@@ -1253,19 +1253,175 @@ class StartupPlaceholderTests(unittest.TestCase):
         self.assertTrue(result["modified"])
         self.assertFalse(result["changed"])
 
-    def test_nonempty_startup_buffer_remains_protected(self) -> None:
+    def test_nonempty_recorded_startup_buffer_is_cleared_and_closed(self) -> None:
+        with (
+            mock.patch.object(broker, "_capture_binding", return_value=self.binding),
+            mock.patch.object(broker.bridge, "activate_buffer_id", return_value=self.binding),
+            mock.patch.object(
+                broker.bridge,
+                "get_document_length",
+                side_effect=[1, 0, 0],
+            ),
+            mock.patch.object(broker, "_dirty", side_effect=[True, True, False]),
+            mock.patch.object(
+                broker.bridge,
+                "write_document_bytes",
+                return_value=0,
+            ) as clear,
+            mock.patch.object(
+                broker.bridge,
+                "set_document_save_point",
+                return_value=True,
+            ) as savepoint,
+            mock.patch.object(
+                broker,
+                "_close_current_tab_if_clean",
+                return_value=True,
+            ) as close,
+        ):
+            result = broker._cleanup_startup_placeholder(self.state, 101)
+
+        self.assertEqual(result["status"], "closed_empty_startup_buffer")
+        self.assertEqual(result["discarded_bytes"], 1)
+        self.assertEqual(result["bytes"], 0)
+        self.assertTrue(result["content_cleared"])
+        self.assertTrue(result["savepoint_cleared"])
+        self.assertTrue(result["changed"])
+        clear.assert_called_once_with(202, b"")
+        savepoint.assert_called_once_with(202)
+        close.assert_called_once_with(
+            101,
+            202,
+            expected_path="new 1",
+            expected_buffer_id=777,
+        )
+
+    def test_nonempty_startup_buffer_retained_empty_after_tab_close_refusal(self) -> None:
+        with (
+            mock.patch.object(broker, "_capture_binding", return_value=self.binding),
+            mock.patch.object(broker.bridge, "activate_buffer_id", return_value=self.binding),
+            mock.patch.object(
+                broker.bridge,
+                "get_document_length",
+                side_effect=[1, 0, 0, 0],
+            ),
+            mock.patch.object(broker, "_dirty", side_effect=[True, True, False, False]),
+            mock.patch.object(broker.bridge, "write_document_bytes", return_value=0),
+            mock.patch.object(broker.bridge, "set_document_save_point", return_value=True),
+            mock.patch.object(
+                broker,
+                "_close_current_tab_if_clean",
+                return_value=False,
+            ),
+        ):
+            result = broker._cleanup_startup_placeholder(self.state, 101)
+
+        self.assertEqual(result["status"], "retained_empty_startup_buffer")
+        self.assertEqual(result["discarded_bytes"], 1)
+        self.assertEqual(result["bytes"], 0)
+        self.assertFalse(result["modified"])
+        self.assertTrue(result["content_cleared"])
+        self.assertTrue(result["changed"])
+
+    def test_recorded_startup_buffer_that_became_real_file_remains_protected(self) -> None:
+        real_file = active_binding(
+            path=r"C:\work\target.cpp",
+            scin=202,
+            buffer_id=777,
+            view=broker.bridge.SUB_VIEW,
+        )
+        with (
+            mock.patch.object(broker, "_capture_binding", return_value=real_file),
+            mock.patch.object(broker.bridge, "activate_buffer_id", return_value=real_file),
+            mock.patch.object(broker.bridge, "write_document_bytes") as clear,
+        ):
+            result = broker._cleanup_startup_placeholder(self.state, 101)
+
+        self.assertEqual(result["status"], "protected_real_file")
+        self.assertFalse(result["changed"])
+        clear.assert_not_called()
+
+    def test_recorded_startup_buffer_reused_by_tracked_file_is_not_protected(self) -> None:
+        path = r"C:\work\target.cpp"
+        real_file = active_binding(
+            path=path,
+            scin=202,
+            buffer_id=777,
+            view=broker.bridge.SUB_VIEW,
+        )
+        with (
+            mock.patch.object(broker, "_capture_binding", return_value=real_file),
+            mock.patch.object(broker.bridge, "activate_buffer_id", return_value=real_file),
+            mock.patch.object(broker, "_load_open_files", return_value={broker._norm(path): {}}),
+            mock.patch.object(broker.bridge, "write_document_bytes") as clear,
+        ):
+            result = broker._cleanup_startup_placeholder(self.state, 101)
+
+        self.assertEqual(result["status"], "reused_as_tracked_file")
+        self.assertFalse(result["changed"])
+        clear.assert_not_called()
+
+    def test_nonempty_startup_buffer_clear_failure_remains_protected(self) -> None:
         with (
             mock.patch.object(broker, "_capture_binding", return_value=self.binding),
             mock.patch.object(broker.bridge, "activate_buffer_id", return_value=self.binding),
             mock.patch.object(broker.bridge, "get_document_length", return_value=1),
             mock.patch.object(broker, "_dirty", return_value=True),
+            mock.patch.object(
+                broker.bridge,
+                "write_document_bytes",
+                side_effect=RuntimeError("SCI_SETTEXT failed"),
+            ),
+            mock.patch.object(broker, "_close_current_tab_if_clean") as close,
+        ):
+            result = broker._cleanup_startup_placeholder(self.state, 101)
+
+        self.assertEqual(result["status"], "clear_failed")
+        self.assertEqual(result["discarded_bytes"], 1)
+        self.assertFalse(result["changed"])
+        close.assert_not_called()
+
+    def test_nonempty_startup_buffer_savepoint_failure_remains_protected(self) -> None:
+        with (
+            mock.patch.object(broker, "_capture_binding", return_value=self.binding),
+            mock.patch.object(broker.bridge, "activate_buffer_id", return_value=self.binding),
+            mock.patch.object(
+                broker.bridge,
+                "get_document_length",
+                side_effect=[1, 0],
+            ),
+            mock.patch.object(broker, "_dirty", side_effect=[True, True]),
+            mock.patch.object(broker.bridge, "write_document_bytes", return_value=0),
+            mock.patch.object(broker.bridge, "set_document_save_point", return_value=False),
+            mock.patch.object(broker, "_close_current_tab_if_clean") as close,
+        ):
+            result = broker._cleanup_startup_placeholder(self.state, 101)
+
+        self.assertEqual(result["status"], "savepoint_failed")
+        self.assertEqual(result["discarded_bytes"], 1)
+        self.assertTrue(result["changed"])
+        close.assert_not_called()
+
+    def test_nonempty_startup_buffer_clear_validation_failure_remains_protected(self) -> None:
+        with (
+            mock.patch.object(broker, "_capture_binding", return_value=self.binding),
+            mock.patch.object(broker.bridge, "activate_buffer_id", return_value=self.binding),
+            mock.patch.object(
+                broker.bridge,
+                "get_document_length",
+                side_effect=[1, 1],
+            ),
+            mock.patch.object(broker, "_dirty", side_effect=[True, True]),
+            mock.patch.object(broker.bridge, "write_document_bytes", return_value=0),
             mock.patch.object(broker.bridge, "set_document_save_point") as savepoint,
             mock.patch.object(broker, "_close_current_tab_if_clean") as close,
         ):
             result = broker._cleanup_startup_placeholder(self.state, 101)
 
-        self.assertEqual(result["status"], "protected_nonempty")
-        self.assertFalse(result["changed"])
+        self.assertEqual(result["status"], "post_clear_validation_failed")
+        self.assertEqual(result["discarded_bytes"], 1)
+        self.assertEqual(result["bytes"], 1)
+        self.assertTrue(result["changed"])
         savepoint.assert_not_called()
         close.assert_not_called()
 
@@ -1332,9 +1488,23 @@ class LiveBindingIntegrationTests(unittest.TestCase):
                     )
                     self.assertFalse(broker._dirty(int(binding["scintilla_hwnd"])))
 
+                    self.assertTrue(
+                        broker.bridge.u32.PostMessageW(
+                            int(binding["scintilla_hwnd"]),
+                            0x0102,
+                            ord("w"),
+                            1,
+                        )
+                    )
+                    time.sleep(0.1)
+                    self.assertEqual(
+                        broker.bridge.get_document_length(int(binding["scintilla_hwnd"])),
+                        0,
+                    )
+
                     shutdown = broker.dgs_shutdown({"wait_timeout": 5})
 
-                    self.assertTrue(shutdown["safe_to_stop"])
+                    self.assertTrue(shutdown["safe_to_stop"], shutdown)
                     self.assertEqual(
                         shutdown["lifecycle"]["placeholder_actions"][0]["status"],
                         "retained_empty_startup_buffer",
@@ -1490,7 +1660,7 @@ class LiveBindingIntegrationTests(unittest.TestCase):
                     shutdown = broker.dgs_shutdown({"wait_timeout": 5})
                     self.assertEqual(len(set(hashes)), 1)
                     self.assertNotEqual(user_proc.pid, managed_pid)
-                    self.assertTrue(shutdown["safe_to_stop"])
+                    self.assertTrue(shutdown["safe_to_stop"], shutdown)
                     self.assertTrue(broker.bridge._is_pid_alive(user_proc.pid))
                     self.assertFalse(broker.bridge._is_pid_alive(managed_pid))
                 finally:
